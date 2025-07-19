@@ -15,7 +15,7 @@ import cv2
 # -------------------------------
 IMG_SIZE = 128  # Change if needed
 BATCH_SIZE = 64
-EPOCHS = 30
+EPOCHS = 40
 
 CODE2TERR = {
     "f": "forest",
@@ -100,13 +100,15 @@ def add_transparent_overlay(image):
 
 def augment_image(img):
     img = tf.convert_to_tensor(img, dtype=tf.float32)
-    img = tf.image.rot90(img, k=1)
-    img = tf.image.random_hue(img, 0.06)
-    img = tf.image.random_saturation(img, 0.8, 1.2)
-    img = tf.image.random_brightness(img, 0.2)
+    k = tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32)
+    img = tf.image.rot90(img, k=k)
+    img = tf.image.random_hue(img, 0.05)
+    img = tf.image.random_saturation(img, 0.6, 1.2)
+    img = tf.image.random_brightness(img, 0.15)
     img = tf.clip_by_value(img, 0, 1)
     img_np = img.numpy()
-    return add_transparent_overlay(img_np)
+    # return add_transparent_overlay(img_np)
+    return img_np
 
 def augment_batch(batch):
     return np.array([augment_image(img) for img in batch])
@@ -115,20 +117,62 @@ def augment_batch(batch):
 # MODEL DEFINITION
 # -------------------------------
 
+def conv_block(x, filters, kernel=3, residual=False):
+    shortcut = x
+    x = layers.Conv2D(filters, kernel, padding='same')(x)
+    # x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU()(x)
+    x = layers.Conv2D(filters, kernel, padding='same')(x)
+    # x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU()(x)
+    # x = layers.Conv2D(filters, kernel, padding='same')(x)
+    # x = layers.BatchNormalization()(x)
+    # x = layers.LeakyReLU()(x)
+    # x = layers.Conv2D(filters, kernel, padding='same')(x)
+    # x = layers.BatchNormalization()(x)
+
+    if residual:
+        shortcut = layers.Conv2D(filters, 1, padding='same')(shortcut)
+        # shortcut = layers.BatchNormalization()(shortcut)
+        x = layers.add([x, shortcut])
+
+    x = layers.LeakyReLU()(x)
+    x = layers.MaxPooling2D()(x)
+    return x
+
+
 def build_model():
     inp = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = layers.Conv2D(32, 3, activation='relu', padding='same')(inp)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(128, 3, activation='relu', padding='same')(x)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(256, 3, activation='relu', padding='same')(x)
+
+    x = conv_block(inp, 16, residual=False)
+    x = conv_block(x, 32, residual=True)
+    x = conv_block(x, 64, residual=True)
+
+    # x = layers.GlobalAveragePooling2D()(x)
+
+    # x = layers.Conv2D(32, 5, activation='relu', padding='same')(inp)
+    # x = layers.MaxPooling2D()(x)
+    # x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
+    # x = layers.MaxPooling2D()(x)
+    # x = layers.Conv2D(128, 3, activation='relu', padding='same')(x)
+    # x = layers.MaxPooling2D()(x)
+    # x = layers.Conv2D(256, 3, activation='relu', padding='same')(x)
+    # x = layers.MaxPooling2D()(x)
+    # x = layers.Conv2D(512, 3, activation='relu', padding='same')(x)
+
     x = layers.MaxPooling2D()(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(512, activation='sigmoid')(x)
+
+    # x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(256, activation='relu')(x)
+    # x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    x = layers.Dense(256, activation='relu')(x)
+
     tile_type = layers.Dense(len(TILE_CLASSES), activation='softmax', name='tile_type')(x)
     crown_count = layers.Dense(len(CROWN_CLASSES), activation='softmax', name='crown_count')(x)
+
     model = models.Model(inputs=inp, outputs=[tile_type, crown_count])
     return model
 
@@ -200,7 +244,7 @@ def main():
             for start in range(0, len(idxs), BATCH_SIZE):
                 end = min(start + BATCH_SIZE, len(idxs))
                 batch_idx = idxs[start:end]
-                if random.random() < 0.5:
+                if random.random() < 0.6:
                     batch_x = augment_batch(X_train[batch_idx])
                 else:
                     batch_x = X_train[batch_idx]
@@ -226,6 +270,31 @@ def main():
     )
     model.save('tile_classifier.h5')
     print('Training done and model saved!')
+
+    print("Manual verification loop starting. Press ENTER to see next image, ESC to quit.")
+
+    for i in range(len(X_val)):
+        img = X_val[i]
+        img_display = (img * 255).astype(np.uint8)
+        img_display = cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR)
+
+        # Predict
+        tile_pred, crown_pred = model.predict(img[None, ...], verbose=0)
+        tile_idx = np.argmax(tile_pred)
+        crown_idx = np.argmax(crown_pred)
+
+        tile_name = CODE2TERR[TILE_CLASSES[tile_idx]]
+        crown_val = CROWN_CLASSES[crown_idx]
+        label = f"{tile_name}, {crown_val}c"
+
+        img_display = draw_label(img_display, label)
+        cv2.imshow("Validation Prediction", img_display)
+
+        key = cv2.waitKey(0)
+        if key == 27:  # ESC
+            print("Exiting manual validation viewer.")
+            cv2.destroyAllWindows()
+            break
 
 if __name__ == "__main__":
     main()

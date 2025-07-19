@@ -105,9 +105,12 @@ def main(board_path, board_size):
     model = tf.keras.models.load_model('tile_classifier.h5')
     # Load board image (already cropped)
     board_img = cv2.imread(board_path)
+
     if board_img is None:
         print("Could not find board image at", board_path)
         return
+
+    board_img = cv2.resize(board_img, (7 * 128, 7 * 128))
 
     # 1. Split board into tiles
     tiles = split_board_into_tiles(board_img, board_size)
