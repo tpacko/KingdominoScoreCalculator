@@ -6,7 +6,7 @@ from tkinter import Tk, Canvas, Button, Label, Frame
 from PIL import Image, ImageTk
 
 ANNOTATION_FILE = "annotations.txt"
-MAX_DISPLAY_SIZE = 1000
+MAX_DISPLAY_SIZE = 900
 
 CODE2TERR = {"f": "forest", "me": "meadow", "mi": "mine",
              "w": "water", "wa": "wasteland", "wh": "wheat", "c": "castle"}
@@ -21,7 +21,7 @@ class BoardAnnotator:
         self.scale = 1.0
         self.rotated = False
         self.orig_size = None
-        self.display_size = None
+        self.rotated_size = None
 
         # Canvas (size will be set dynamically)
         self.canvas = Canvas(root)
@@ -72,10 +72,10 @@ class BoardAnnotator:
             img = img.rotate(-90, expand=True)
             self.rotated = True
 
-        self.display_size = img.size  # rotated or original
+        self.rotated_size = img.size  # rotated or original
 
         # Compute scale
-        scale = min(MAX_DISPLAY_SIZE / img.width, MAX_DISPLAY_SIZE / img.height)
+        scale = MAX_DISPLAY_SIZE / img.width
         self.scale = scale
         new_size = (int(img.width * scale), int(img.height * scale))
         img_resized = img.resize(new_size, Image.LANCZOS)
@@ -93,8 +93,8 @@ class BoardAnnotator:
             orig_pts = [(pts[i], pts[i + 1]) for i in range(0, len(pts), 2)]  # (x0, y0)
             if self.rotated:
                 orig_w, orig_h = self.orig_size  # W0, H0
-                # forward rotation: (x_r, y_r) = (y0, W0-1-x0)
-                rot_pts = [(y0, orig_w - 1 - x0) for (x0, y0) in orig_pts]
+                # clockwise rotation
+                rot_pts = [(orig_h - y0, x0) for (x0, y0) in orig_pts]
             else:
                 rot_pts = orig_pts
 
@@ -142,8 +142,7 @@ class BoardAnnotator:
         # 2) inverse rotate back to original-image coords
         if self.rotated:
             orig_w, orig_h = self.orig_size  # W0, H0
-            # (x0, y0) = (W0-1-y_r, x_r)
-            orig_pts = [(orig_w - 1 - y_r, x_r) for (x_r, y_r) in pts_rot]
+            orig_pts = [(y_r, orig_h - x_r) for (x_r, y_r) in pts_rot]
         else:
             orig_pts = pts_rot
 
