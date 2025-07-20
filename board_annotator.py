@@ -2,11 +2,11 @@ import os
 import glob
 import csv
 import re
-from tkinter import Tk, Canvas, Button, Label, Frame
+from tkinter import Tk, Canvas, Button, Label, Frame, Checkbutton, IntVar
 from PIL import Image, ImageTk
 
 ANNOTATION_FILE = "annotations.txt"
-MAX_DISPLAY_SIZE = 900
+MAX_DISPLAY_SIZE = 800
 
 CODE2TERR = {"f": "forest", "me": "meadow", "mi": "mine",
              "w": "water", "wa": "wasteland", "wh": "wheat", "c": "castle"}
@@ -22,6 +22,7 @@ class BoardAnnotator:
         self.rotated = False
         self.orig_size = None
         self.rotated_size = None
+        self.skip_annotated = IntVar(value=0)
 
         # Canvas (size will be set dynamically)
         self.canvas = Canvas(root)
@@ -34,6 +35,7 @@ class BoardAnnotator:
         Button(btn_frame, text="Skip", command=self.skip).pack(side="left")
         self.confirm_btn = Button(btn_frame, text="Confirm", command=self.confirm, state="disabled")
         self.confirm_btn.pack(side="left")
+        Checkbutton(btn_frame, text="Skip all annotated", variable=self.skip_annotated).pack(side="left")
 
         # Status label
         self.status = Label(root, text="")
@@ -55,8 +57,18 @@ class BoardAnnotator:
             for fname, pts in self.annotations.items():
                 writer.writerow([fname] + pts)
 
+    def find_next_index(self, start_idx=0):
+        if not self.skip_annotated.get():
+            return start_idx
+        for idx in range(start_idx, len(self.image_paths)):
+            fname = os.path.basename(self.image_paths[idx])
+            if fname not in self.annotations:
+                return idx
+        return len(self.image_paths)
+
     def load_image(self):
         self.points = []
+        self.index = self.find_next_index(self.index)
         if self.index >= len(self.image_paths):
             self.status.config(text="All images annotated.")
             self.canvas.delete("all")
@@ -64,41 +76,34 @@ class BoardAnnotator:
 
         self.filename = os.path.basename(self.image_paths[self.index])
         img = Image.open(self.image_paths[self.index])
-        self.orig_size = img.size  # original unrotated size (W0, H0)
+        self.orig_size = img.size
         self.rotated = False
 
-        # Rotate if portrait
         if img.height > img.width:
             img = img.rotate(-90, expand=True)
             self.rotated = True
 
-        self.rotated_size = img.size  # rotated or original
+        self.rotated_size = img.size
 
-        # Compute scale
         scale = MAX_DISPLAY_SIZE / img.width
         self.scale = scale
         new_size = (int(img.width * scale), int(img.height * scale))
         img_resized = img.resize(new_size, Image.LANCZOS)
         self.tk_img = ImageTk.PhotoImage(img_resized)
 
-        # Setup canvas
         self.canvas.config(width=new_size[0], height=new_size[1])
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img)
         self.status.config(text=f"Annotating {self.filename}")
 
-        # Load saved annotations and transform into display coords
         if self.filename in self.annotations:
             pts = self.annotations[self.filename]
-            orig_pts = [(pts[i], pts[i + 1]) for i in range(0, len(pts), 2)]  # (x0, y0)
+            orig_pts = [(pts[i], pts[i + 1]) for i in range(0, len(pts), 2)]
             if self.rotated:
-                orig_w, orig_h = self.orig_size  # W0, H0
-                # clockwise rotation
+                orig_w, orig_h = self.orig_size
                 rot_pts = [(orig_h - y0, x0) for (x0, y0) in orig_pts]
             else:
                 rot_pts = orig_pts
-
-            # scale to display
             self.points = [self.scale_coords(pt) for pt in rot_pts]
             self.redraw()
 
@@ -132,31 +137,28 @@ class BoardAnnotator:
 
     def skip(self):
         self.index += 1
+        self.index = self.find_next_index(self.index)
         self.load_image()
 
     def confirm(self):
         if len(self.points) != 4:
             return
-        # 1) descale display coords back to rotated-image coords
         pts_rot = [self.descale_coords(p) for p in self.points]
-        # 2) inverse rotate back to original-image coords
         if self.rotated:
-            orig_w, orig_h = self.orig_size  # W0, H0
+            orig_w, orig_h = self.orig_size
             orig_pts = [(y_r, orig_h - x_r) for (x_r, y_r) in pts_rot]
         else:
             orig_pts = pts_rot
-
-        # flatten and save
         flat = [int(round(c)) for pt in orig_pts for c in pt]
         self.annotations[self.filename] = flat
         self.save_annotations()
         self.index += 1
+        self.index = self.find_next_index(self.index)
         self.load_image()
-
 
 def main():
     input_dir = "files"
-    pattern = re.compile(r'^game\d+\.' )
+    pattern = re.compile(r'^game\d+\.')
     image_files = sorted([
         f for f in glob.glob(os.path.join(input_dir, '*.*'))
         if pattern.match(os.path.basename(f))
