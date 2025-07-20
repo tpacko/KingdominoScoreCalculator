@@ -137,7 +137,7 @@ def train(model, dataset, epochs=15, checkpoint_dir="./checkpoints"):
             with tf.GradientTape() as tape:
                 hms_pred, offs_pred = model(imgs, training=True)
                 l1 = heatmap_loss(hms_true, hms_pred)
-                l2 = 0.01 * offset_loss(offs_true, offs_pred, mask)
+                l2 = 0.5 * offset_loss(offs_true, offs_pred, mask)
                 loss = l1 + l2
             grads = tape.gradient(loss, model.trainable_weights)
             optimizer.apply_gradients(zip(grads, model.trainable_weights))
@@ -247,7 +247,7 @@ def main():
     parser = argparse.ArgumentParser(description='Board keypoint detector training and evaluation.')
     parser.add_argument('--annotations', type=str, default='annotations.txt')
     parser.add_argument('--images', type=str, default='files')
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=5000)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--detections', type=int, default=3)
     args = parser.parse_args()

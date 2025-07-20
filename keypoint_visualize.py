@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
 # ==== USER-EDITABLE PARAMETERS (set all here!) ====
-MODEL_PATH      = "board_keypoint_detector_v1.h5"
+MODEL_PATH      = "board_keypoint_detector_v3.h5"
+# MODEL_PATH      = "checkpoints/best.h5"
 IMG_FOLDER      = "files"
 IMG_SIZE        = 1000
 HEATMAP_DOWNSAMPLE = 8
@@ -54,10 +55,12 @@ def predict_corners(model, img_resized):
     corners = []
     for blob in blobs[:NUM_CORNERS]:
         x, y = blob['peak_x'], blob['peak_y']
-        fx = x * IMG_SIZE / HM_SIZE
-        fy = y * IMG_SIZE / HM_SIZE
         ox, oy = off_pred[y, x]
-        rx, ry = fx + ox, fy + oy
+        fx = (x + ox) * IMG_SIZE / HM_SIZE
+        fy = (y + oy) * IMG_SIZE / HM_SIZE
+        # rx, ry = fx + ox, fy + oy
+        rx = int(round(fx))
+        ry = int(round(fy))
         corners.append((rx, ry, blob['prob']))
     return hm_pred, labeled, corners
 
