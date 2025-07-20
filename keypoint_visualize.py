@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
 # ==== USER-EDITABLE PARAMETERS (set all here!) ====
-MODEL_PATH      = "board_keypoint_detector_v3.h5"
+MODEL_PATH      = "board_keypoint_detector.h5"
 # MODEL_PATH      = "checkpoints/best.h5"
 IMG_FOLDER      = "files"
 IMG_SIZE        = 1000
