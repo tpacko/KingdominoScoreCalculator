@@ -6,7 +6,9 @@ from tkinter import Tk, Canvas, Button, Label, Frame, Checkbutton, IntVar
 from PIL import Image, ImageTk
 
 ANNOTATION_FILE = "annotations.txt"
-MAX_DISPLAY_SIZE = 800
+MAX_DISPLAY_SIZE = 700
+ZOOM_SIZE = 200     # Display size for zoom window
+ZOOM_FACTOR = 4     # How much to zoom (4x)
 
 CODE2TERR = {"f": "forest", "me": "meadow", "mi": "mine",
              "w": "water", "wa": "wasteland", "wh": "wheat", "c": "castle"}
@@ -23,10 +25,19 @@ class BoardAnnotator:
         self.orig_size = None
         self.rotated_size = None
         self.skip_annotated = IntVar(value=0)
+        self.zoom_img = None
+        self.displayed_img = None
 
-        # Canvas (size will be set dynamically)
-        self.canvas = Canvas(root)
-        self.canvas.pack(side="top")
+        # Layout
+        main_frame = Frame(root)
+        main_frame.pack(side="top", fill="both", expand=True)
+
+        self.canvas = Canvas(main_frame, bg="grey")
+        self.canvas.pack(side="left")
+
+        # Zoom Canvas on the right
+        self.zoom_canvas = Canvas(main_frame, width=ZOOM_SIZE, height=ZOOM_SIZE, bg="black", highlightthickness=1, highlightbackground="grey")
+        self.zoom_canvas.pack(side="left", padx=10)
 
         # Button panel
         btn_frame = Frame(root)
@@ -42,6 +53,8 @@ class BoardAnnotator:
         self.status.pack(side="top")
 
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Motion>", self.on_motion)
+
         self.load_image()
 
     def load_annotations(self):
@@ -72,6 +85,7 @@ class BoardAnnotator:
         if self.index >= len(self.image_paths):
             self.status.config(text="All images annotated.")
             self.canvas.delete("all")
+            self.zoom_canvas.delete("all")
             return
 
         self.filename = os.path.basename(self.image_paths[self.index])
@@ -89,12 +103,14 @@ class BoardAnnotator:
         self.scale = scale
         new_size = (int(img.width * scale), int(img.height * scale))
         img_resized = img.resize(new_size, Image.LANCZOS)
+        self.displayed_img = img_resized
         self.tk_img = ImageTk.PhotoImage(img_resized)
 
         self.canvas.config(width=new_size[0], height=new_size[1])
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img)
         self.status.config(text=f"Annotating {self.filename}")
+        self.zoom_canvas.delete("all")
 
         if self.filename in self.annotations:
             pts = self.annotations[self.filename]
@@ -155,6 +171,37 @@ class BoardAnnotator:
         self.index += 1
         self.index = self.find_next_index(self.index)
         self.load_image()
+
+    def on_motion(self, event):
+        if self.displayed_img is None:
+            return
+
+        x, y = event.x, event.y
+        img_w, img_h = self.displayed_img.size
+        half_box = ZOOM_SIZE // (2 * ZOOM_FACTOR)
+
+        left = int(max(0, x - half_box))
+        upper = int(max(0, y - half_box))
+        right = int(min(img_w, x + half_box))
+        lower = int(min(img_h, y + half_box))
+
+        # If out of bounds, adjust box
+        if left == 0:
+            right = min(ZOOM_SIZE // ZOOM_FACTOR, img_w)
+        if upper == 0:
+            lower = min(ZOOM_SIZE // ZOOM_FACTOR, img_h)
+        if right == img_w:
+            left = max(0, img_w - ZOOM_SIZE // ZOOM_FACTOR)
+        if lower == img_h:
+            upper = max(0, img_h - ZOOM_SIZE // ZOOM_FACTOR)
+
+        box = (left, upper, right, lower)
+        region = self.displayed_img.crop(box)
+        zoomed = region.resize((ZOOM_SIZE, ZOOM_SIZE), Image.NEAREST)
+        self.zoom_img = ImageTk.PhotoImage(zoomed)
+        self.zoom_canvas.delete("all")
+        self.zoom_canvas.create_image(0, 0, anchor="nw", image=self.zoom_img)
+        self.zoom_canvas.create_rectangle(ZOOM_SIZE//2-1, ZOOM_SIZE//2-1, ZOOM_SIZE//2+1, ZOOM_SIZE//2+1, outline="red")
 
 def main():
     input_dir = "files"
