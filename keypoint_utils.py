@@ -3,8 +3,9 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
-IMG_SIZE = 1000
-HEATMAP_DOWNSAMPLE = 4
+
+IMG_SIZE = 512
+HEATMAP_DOWNSAMPLE = 8
 HM_SIZE = IMG_SIZE // HEATMAP_DOWNSAMPLE
 HEATMAP_SIGMA = 4
 NUM_CORNERS = 4
@@ -46,27 +47,21 @@ def generate_targets(kps, img_size=IMG_SIZE, hm_size=HM_SIZE):
         x, y = kp
         fx = x * scale
         fy = y * scale
-        ix, iy = int(round(fx)), int(round(fy))
-        if ix < 0 or iy < 0 or ix >= hm_size or iy >= hm_size:
-            continue
-
-        for dx in range(-3 * HEATMAP_SIGMA, 3 * HEATMAP_SIGMA + 1):
-            for dy in range(-3 * HEATMAP_SIGMA, 3 * HEATMAP_SIGMA + 1):
-                nx, ny = ix + dx, iy + dy
-                if not (0 <= nx < hm_size and 0 <= ny < hm_size):
-                    continue
-
-                d2 = (fx - nx) ** 2 + (fy - ny) ** 2
-                val = np.exp(-d2 / (2 * HEATMAP_SIGMA ** 2))
-
-                if val > heatmap[ny, nx, 0]:
+        # Find top-left corner of 2x2 cell
+        ix0 = int(np.floor(fx))
+        iy0 = int(np.floor(fy))
+        for dx in [0, 1]:
+            for dy in [0, 1]:
+                nx = ix0 + dx
+                ny = iy0 + dy
+                if 0 <= nx < hm_size and 0 <= ny < hm_size:
+                    val = 1
+                    # If you want only the four closest, don't compare with existing values, just set them
                     heatmap[ny, nx, 0] = val
                     offsets[ny, nx, 0] = fx - nx
                     offsets[ny, nx, 1] = fy - ny
                     mask[ny, nx, 0] = 1
-
     return heatmap, offsets, mask
-
 
 def reconstruct_keypoints(heatmap, offsets, threshold=0.5, img_size=IMG_SIZE, hm_size=HM_SIZE):
     """

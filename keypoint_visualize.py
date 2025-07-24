@@ -5,18 +5,14 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
-# ==== USER-EDITABLE PARAMETERS (set all here!) ====
+import keypoint_utils
+
+# ==== USER-EDITABLE PARAMETERS (model + folders only!) ====
 MODEL_PATH      = "board_keypoint_detector.h5"
-# MODEL_PATH      = "checkpoints/best.h5"
 IMG_FOLDER      = "files"
-IMG_SIZE        = 1000
-HEATMAP_DOWNSAMPLE = 8
-NUM_CORNERS     = 4
-HEATMAP_THRESH  = 0.95   # Minimum probability for blob detection
+HEATMAP_THRESH  = 0.85   # Minimum probability for blob detection
 SHOW_MAX_IMAGES = 50
 # ================================================
-
-HM_SIZE = IMG_SIZE // HEATMAP_DOWNSAMPLE
 
 def resize_img(img, desired_size):
     h0, w0 = img.shape[:2]
@@ -53,12 +49,11 @@ def predict_corners(model, img_resized):
     blobs = get_blob_peaks(labeled, num, hm_pred)
 
     corners = []
-    for blob in blobs[:NUM_CORNERS]:
+    for blob in blobs[:keypoint_utils.NUM_CORNERS]:
         x, y = blob['peak_x'], blob['peak_y']
         ox, oy = off_pred[y, x]
-        fx = (x + ox) * IMG_SIZE / HM_SIZE
-        fy = (y + oy) * IMG_SIZE / HM_SIZE
-        # rx, ry = fx + ox, fy + oy
+        fx = (x + ox) * keypoint_utils.IMG_SIZE / keypoint_utils.HM_SIZE
+        fy = (y + oy) * keypoint_utils.IMG_SIZE / keypoint_utils.HM_SIZE
         rx = int(round(fx))
         ry = int(round(fy))
         corners.append((rx, ry, blob['prob']))
@@ -78,7 +73,6 @@ def visualize_all(img, img_resized, hm_pred, labeled, corners, fname):
     axes[2].set_title(f"Predicted Heatmap\n(threshold {HEATMAP_THRESH})")
     axes[2].axis('off')
 
-    # Mark all blobs' peaks on the image
     axes[3].imshow(img_resized)
     for (rx, ry, prob) in corners:
         axes[3].plot(rx, ry, 'go', markersize=12, label=f"{prob:.2f}")
@@ -108,7 +102,7 @@ def main():
         if img is None:
             print(f"Could not read {img_path}")
             continue
-        img_resized = resize_img(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), IMG_SIZE)
+        img_resized = resize_img(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), keypoint_utils.IMG_SIZE)
         hm_pred, labeled, corners = predict_corners(model, img_resized)
         visualize_all(img, img_resized, hm_pred, labeled, corners, fname)
 

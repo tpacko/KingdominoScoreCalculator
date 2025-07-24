@@ -13,7 +13,7 @@ def convert_h5_to_tflite(keras_model_path, tflite_model_path, quantize=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Convert Keras .h5 model to TensorFlow Lite .tflite")
-    parser.add_argument("--h5_path", help="Path to the input .h5 Keras model", default="./board_keypoint_detector_v3.h5")
+    parser.add_argument("--h5_path", help="Path to the input .h5 Keras model", default="./board_keypoint_detector_v1.h5")
     parser.add_argument("--tflite_path", help="Path to output .tflite file", default="./board_keypoint_detector.tflite")
     parser.add_argument("--quantize", action="store_true", help="Enable quantization (smaller/faster models)")
     args = parser.parse_args()

@@ -191,30 +191,54 @@ class BoardDataset(tf.keras.utils.Sequence):
 def build_model(base_filters=16):
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
 
-    x = layers.Conv2D(base_filters, 3, strides=1, padding='same', activation='relu',
+    x = layers.Conv2D(base_filters, 5, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(inputs)
     x = layers.Conv2D(base_filters * 2, 3, strides=2, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
 
     x = layers.Conv2D(base_filters * 2, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x = layers.Conv2D(base_filters * 4, 3, strides=2, padding='same', activation='relu',
+    x = layers.Conv2D(base_filters * 2, 3, strides=2, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
 
     x = layers.Conv2D(base_filters * 4, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
+    x = layers.Conv2D(base_filters * 4, 3, strides=2, padding='same', activation='relu',
+                      kernel_regularizer=keras.regularizers.l2(1e-4))(x)
+
+    x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
+                      kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x = layers.Dropout(0.2)(x)
-    x = layers.Conv2D(base_filters * 4, 3, strides=1, padding='same', activation='relu',
+    x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x = layers.Dropout(0.2)(x)
 
     heatmap = layers.Conv2D(1, 1, activation='sigmoid', name='heatmap')(x)
-    offsets = layers.Conv2D(2, 1, activation=None, name='offsets')(x)
+    offsets = layers.Conv2D(2, 1, activation='tanh', name='offsets')(x)
     return keras.Model(inputs, [heatmap, offsets])
 
 # ============= Losses =============
 
-def heatmap_loss(y_true, y_pred, smooth=1e-6):
+def bce_loss(y_true, y_pred):
+    return tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
+    # return 0
+
+def tversky_loss(y_true, y_pred, alpha=0.4, beta=0.6, smooth=1e-6):
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+    tp = tf.reduce_sum(y_true_f * y_pred_f)
+    fn = tf.reduce_sum(y_true_f * (1 - y_pred_f))
+    fp = tf.reduce_sum((1 - y_true_f) * y_pred_f)
+    tversky = (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
+    return 1 - tversky
+
+def focal_loss(y_true, y_pred, gamma=2., alpha=0.25):
+    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    bce_exp = tf.exp(-bce)
+    focal = alpha * (1 - bce_exp) ** gamma * bce
+    return tf.reduce_mean(focal)
+
+def dice_loss(y_true, y_pred, smooth=1e-6):
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
     intersection = tf.reduce_sum(y_true_f * y_pred_f)
@@ -233,18 +257,26 @@ def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkp
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_loss = float("inf")
 
+    def l1_loss(y_true, y_pred):
+        # return tversky_loss(y_true, y_pred) + 10 * focal_loss(y_true, y_pred)
+        return bce_loss(y_true, y_pred) + dice_loss(y_true, y_pred)
+
+    def l2_loss(offs_true, offs_pred, mask):
+        return 0.1 * offset_loss(offs_true, offs_pred, mask)
+
     for epoch in range(epochs):
         hm_losses, off_losses = [], []
         print(f"\nEpoch {epoch+1}/{epochs}")
 
-        for imgs, targets in tqdm(train_dataset, desc='Training', leave=False):
+        for imgs, targets in tqdm(train_dataset, desc='Training', leave=True):
             hms_true = targets['heatmap']
             offs_true = targets['offsets']
             mask = targets['mask']
             with tf.GradientTape() as tape:
                 hms_pred, offs_pred = model(imgs, training=True)
-                l1 = heatmap_loss(hms_true, hms_pred)
-                l2 = 0.25 * offset_loss(offs_true, offs_pred, mask)
+                # training
+                l1 = l1_loss(hms_true, hms_pred)
+                l2 = l2_loss(offs_true, offs_pred, mask)
                 loss = l1 + l2
             grads = tape.gradient(loss, model.trainable_weights)
             optimizer.apply_gradients(zip(grads, model.trainable_weights))
@@ -260,8 +292,9 @@ def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkp
             offs_true = targets['offsets']
             mask = targets['mask']
             hms_pred, offs_pred = model(imgs, training=False)
-            l1 = heatmap_loss(hms_true, hms_pred)
-            l2 = 0.1 * offset_loss(offs_true, offs_pred, mask)
+            # validation !!
+            l1 = l1_loss(hms_true, hms_pred)
+            l2 = l2_loss(offs_true, offs_pred, mask)
             val_hm_losses.append(l1.numpy())
             val_off_losses.append(l2.numpy())
         mean_val_hm_loss = np.mean(val_hm_losses)
