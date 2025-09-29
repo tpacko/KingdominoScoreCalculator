@@ -1,4 +1,6 @@
 import os
+from time import sleep
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -198,9 +200,13 @@ def build_model(base_filters=16):
 
     x = layers.Conv2D(base_filters * 2, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
+    x = layers.Conv2D(base_filters * 2, 3, strides=1, padding='same', activation='relu',
+                      kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x = layers.Conv2D(base_filters * 2, 3, strides=2, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
 
+    x = layers.Conv2D(base_filters * 4, 3, strides=1, padding='same', activation='relu',
+                      kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x = layers.Conv2D(base_filters * 4, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x = layers.Conv2D(base_filters * 4, 3, strides=2, padding='same', activation='relu',
@@ -208,16 +214,57 @@ def build_model(base_filters=16):
 
     x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x = layers.Dropout(0.2)(x)
+    # x = layers.Dropout(0.2)(x)
     x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x = layers.Dropout(0.2)(x)
+    # x = layers.Dropout(0.2)(x)
+    x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
+                      kernel_regularizer=keras.regularizers.l2(1e-4))(x)
+    # x = layers.Dropout(0.2)(x)
 
     heatmap = layers.Conv2D(1, 1, activation='sigmoid', name='heatmap')(x)
     offsets = layers.Conv2D(2, 1, activation='tanh', name='offsets')(x)
     return keras.Model(inputs, [heatmap, offsets])
 
 # ============= Losses =============
+
+def sampled_bce_loss(y_true, y_pred, num_negatives=200):
+    # Flatten
+    y_true = tf.reshape(y_true, [-1])
+    y_pred = tf.reshape(y_pred, [-1])
+
+    # Per-element BCE, no reduction
+    bce = tf.keras.backend.binary_crossentropy(y_true, y_pred)
+    bce = tf.reshape(bce, [-1])
+
+    # Indices of positives and negatives
+    pos_idx = tf.where(y_true > 0.5)[:, 0]
+    neg_idx = tf.where(y_true <= 0.5)[:, 0]
+
+    pos_loss = tf.gather(bce, pos_idx)
+
+    # Sample k negatives WITHOUT RandomShuffle
+    n_neg = tf.shape(neg_idx)[0]
+    k = tf.minimum(num_negatives, n_neg)
+
+    # Random scores -> take top-k indices; no gradient path to y_pred
+    rand_scores = tf.random.uniform([n_neg], dtype=tf.float32)
+    sample_pos_in_neg = tf.math.top_k(rand_scores, k, sorted=False).indices
+    sampled_neg_idx = tf.gather(neg_idx, sample_pos_in_neg)
+    sampled_neg_idx = tf.stop_gradient(sampled_neg_idx)  # ensure no grad through sampling
+
+    neg_loss = tf.gather(bce, sampled_neg_idx)
+
+    # Handle empty cases robustly
+    parts = []
+    if pos_loss.shape.rank is not None:
+        parts.append(pos_loss)
+    else:
+        parts.append(tf.zeros([0], bce.dtype))
+    parts.append(neg_loss)
+
+    total = tf.concat(parts, axis=0)
+    return tf.reduce_mean(total)
 
 def bce_loss(y_true, y_pred):
     return tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
@@ -259,14 +306,17 @@ def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkp
 
     def l1_loss(y_true, y_pred):
         # return tversky_loss(y_true, y_pred) + 10 * focal_loss(y_true, y_pred)
-        return bce_loss(y_true, y_pred) + dice_loss(y_true, y_pred)
+        # return 10 * bce_loss(y_true, y_pred) + dice_loss(y_true, y_pred)
+        return bce_loss(y_true, y_pred)
+        # return sampled_bce_loss(y_true, y_pred, 128 * 4) # number of negatives to sample
 
     def l2_loss(offs_true, offs_pred, mask):
-        return 0.1 * offset_loss(offs_true, offs_pred, mask)
+        return 0.0 * offset_loss(offs_true, offs_pred, mask)
 
     for epoch in range(epochs):
         hm_losses, off_losses = [], []
         print(f"\nEpoch {epoch+1}/{epochs}")
+        sleep(1)
 
         for imgs, targets in tqdm(train_dataset, desc='Training', leave=True):
             hms_true = targets['heatmap']
@@ -306,7 +356,10 @@ def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkp
 
         if mean_val_loss < best_loss:
             best_loss = mean_val_loss
+            print(f"New best validation loss: {best_loss:.4f}, saving model weights...")
             model.save(os.path.join(checkpoint_dir, "best.h5"))
+
+        sleep(5)
 
     return model
 
@@ -388,7 +441,7 @@ def main():
     parser = argparse.ArgumentParser(description='Board keypoint detector training and evaluation.')
     parser.add_argument('--annotations', type=str, default='annotations.txt')
     parser.add_argument('--images', type=str, default='files')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=12)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--detections', type=int, default=5)
     args = parser.parse_args()
