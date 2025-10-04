@@ -8,7 +8,8 @@ from scipy.ndimage import label
 import keypoint_utils
 
 # ==== USER-EDITABLE PARAMETERS (model + folders only!) ====
-MODEL_PATH      = "board_keypoint_detector.h5"
+# MODEL_PATH      = "board_keypoint_detector.h5"
+MODEL_PATH      = "checkpoints/best.h5"
 IMG_FOLDER      = "files"
 HEATMAP_THRESH  = 0.85   # Minimum probability for blob detection
 SHOW_MAX_IMAGES = 50
@@ -41,7 +42,10 @@ def get_blob_peaks(labeled, num, hm):
 def predict_corners(model, img_resized):
     inp = img_resized / 255.0
     inp = np.expand_dims(inp, 0)
-    hm_pred, off_pred = model.predict(inp)
+    # Get all three outputs: heatmap, offsets, segmentation
+    outputs = model.predict(inp)
+    hm_pred, off_pred, seg_pred = outputs
+    seg_pred = seg_pred[0, ..., 0]
     hm_pred = hm_pred[0, ..., 0]
     off_pred = off_pred[0]
 
@@ -57,10 +61,10 @@ def predict_corners(model, img_resized):
         rx = int(round(fx))
         ry = int(round(fy))
         corners.append((rx, ry, blob['prob']))
-    return hm_pred, labeled, corners
+    return hm_pred, labeled, corners, seg_pred
 
-def visualize_all(img, img_resized, hm_pred, labeled, corners, fname):
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+def visualize_all(img, img_resized, hm_pred, labeled, corners, fname, seg_pred=None):
+    fig, axes = plt.subplots(1, 5 if seg_pred is not None else 4, figsize=(30, 6) if seg_pred is not None else (24, 6))
     axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     axes[0].set_title("Original Image")
     axes[0].axis('off')
@@ -79,6 +83,14 @@ def visualize_all(img, img_resized, hm_pred, labeled, corners, fname):
         axes[3].annotate(f"{prob:.2f}", (rx, ry), color='lime', fontsize=12)
     axes[3].set_title(f"Predicted Corners ({len(corners)} blobs)")
     axes[3].axis('off')
+
+    seg_up = cv2.resize(seg_pred, (img_resized.shape[1], img_resized.shape[0]), interpolation=cv2.INTER_NEAREST)
+    seg_color = cv2.applyColorMap((seg_up*255).astype(np.uint8), cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR), 0.7, seg_color, 0.3, 0)
+    axes[4].imshow(overlay)
+    axes[4].set_title("Segmentation Overlay")
+    axes[4].axis('off')
+
     plt.suptitle(f"Results for {fname}")
     plt.tight_layout()
     plt.show()
@@ -103,8 +115,8 @@ def main():
             print(f"Could not read {img_path}")
             continue
         img_resized = resize_img(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), keypoint_utils.IMG_SIZE)
-        hm_pred, labeled, corners = predict_corners(model, img_resized)
-        visualize_all(img, img_resized, hm_pred, labeled, corners, fname)
+        hm_pred, labeled, corners, seg_pred = predict_corners(model, img_resized)
+        visualize_all(img, img_resized, hm_pred, labeled, corners, fname, seg_pred)
 
 if __name__ == "__main__":
     main()

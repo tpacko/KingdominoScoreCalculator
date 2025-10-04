@@ -14,10 +14,21 @@ from sklearn.model_selection import train_test_split
 
 import keypoint_utils as kpu
 
+
+# ============= CONFIGURATION =============
+
 CHECKPOINT_PATH = "board_keypoint_detector.h5"
 IMG_SIZE = kpu.IMG_SIZE
 HM_SIZE = kpu.HM_SIZE
 NUM_CORNERS = kpu.NUM_CORNERS
+
+ANNOTATIONS_PATH = 'annotations.txt'
+IMAGES_PATH = 'files'
+EPOCHS = 15
+BATCH_SIZE = 4
+DETECTIONS = 5
+LEARNING_RATE = 1e-4
+# ============= END CONFIGURATION =============
 
 # ============= Augmentations (same as above) =============
 
@@ -70,7 +81,7 @@ def random_small_rotation(img, kps, angle_range=30):
         return img, kps
     return img_rot, kps_rot
 
-def random_scale(img, kps, scale_range=(0.7, 1.2)):
+def random_scale(img, kps, scale_range=(0.9, 1.2)):
     scale = np.random.uniform(*scale_range)
     M = np.array([
         [scale, 0, (1-scale)*IMG_SIZE/2],
@@ -97,7 +108,7 @@ def random_translate(img, kps, frac=0.1):
         return img, kps
     return img_trans, kps_trans
 
-def color_jitter(img, kps, brightness=0.2, contrast=0.2, saturation=0.2):
+def color_jitter(img, kps, brightness=0.5, contrast=0.5, saturation=0.5):
     img_out = img.astype(np.float32)
     img_out += np.random.uniform(-brightness*255, brightness*255)
     factor = np.random.uniform(1-contrast, 1+contrast)
@@ -173,24 +184,32 @@ class BoardDataset(tf.keras.utils.Sequence):
         return int(np.ceil(len(self.aug_img_kps) / self.batch_size))
 
     def __getitem__(self, idx):
-        batch = self.aug_img_kps[idx * self.batch_size:(idx + 1) * self.batch_size]
-        imgs, hms, offs, masks = [], [], [], []
+        # Use shuffled indices for batch selection
+        batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch = [self.aug_img_kps[i] for i in batch_indices]
+        imgs, hms, offs, masks, segs = [], [], [], [], []
         for img, kp in batch:
             imgs.append(img / 255.0)
-            hm, off, mask = kpu.generate_targets(kp)
-            hms.append(hm)
-            offs.append(off)
-            masks.append(mask)
-        return np.array(imgs), {'heatmap': np.array(hms), 'offsets': np.array(offs), 'mask': np.array(masks)}
+            hm, off, mask, seg = kpu.generate_targets(kp)
+            hms.append(hm); offs.append(off); masks.append(mask); segs.append(seg)
+        return np.array(imgs), {
+            'heatmap': np.array(hms),
+            'offsets': np.array(offs),
+            'mask':    np.array(masks),
+            'segmask': np.array(segs),
+        }
 
     def single_samples(self):
-        for img, kp in self.aug_img_kps:
-            hm, off, mask = kpu.generate_targets(kp)
-            yield img, kp, hm, off, mask
+        for img, kp in random.sample(self.aug_img_kps, len(self.aug_img_kps)):
+            hm, off, mask, seg = kpu.generate_targets(kp)
+            yield img, kp, hm, off, mask, seg
+
+    def on_epoch_end(self):
+        np.random.shuffle(self.indices)
 
 # ============= Model =============
 
-def build_model(base_filters=16):
+def build_model(base_filters=32):
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
 
     x = layers.Conv2D(base_filters, 5, strides=1, padding='same', activation='relu',
@@ -214,61 +233,44 @@ def build_model(base_filters=16):
 
     x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    # x = layers.Dropout(0.2)(x)
     x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    # x = layers.Dropout(0.2)(x)
     x = layers.Conv2D(base_filters * 8, 3, strides=1, padding='same', activation='relu',
                       kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    # x = layers.Dropout(0.2)(x)
 
     heatmap = layers.Conv2D(1, 1, activation='sigmoid', name='heatmap')(x)
     offsets = layers.Conv2D(2, 1, activation='tanh', name='offsets')(x)
-    return keras.Model(inputs, [heatmap, offsets])
+    segmask = layers.Conv2D(1, 1, activation='sigmoid', name='segmentation')(x)
+    return keras.Model(inputs, [heatmap, offsets, segmask])
 
 # ============= Losses =============
 
 def sampled_bce_loss(y_true, y_pred, num_negatives=200):
-    # Flatten
     y_true = tf.reshape(y_true, [-1])
     y_pred = tf.reshape(y_pred, [-1])
-
-    # Per-element BCE, no reduction
     bce = tf.keras.backend.binary_crossentropy(y_true, y_pred)
     bce = tf.reshape(bce, [-1])
-
-    # Indices of positives and negatives
     pos_idx = tf.where(y_true > 0.5)[:, 0]
     neg_idx = tf.where(y_true <= 0.5)[:, 0]
-
     pos_loss = tf.gather(bce, pos_idx)
-
-    # Sample k negatives WITHOUT RandomShuffle
     n_neg = tf.shape(neg_idx)[0]
     k = tf.minimum(num_negatives, n_neg)
-
-    # Random scores -> take top-k indices; no gradient path to y_pred
     rand_scores = tf.random.uniform([n_neg], dtype=tf.float32)
     sample_pos_in_neg = tf.math.top_k(rand_scores, k, sorted=False).indices
     sampled_neg_idx = tf.gather(neg_idx, sample_pos_in_neg)
-    sampled_neg_idx = tf.stop_gradient(sampled_neg_idx)  # ensure no grad through sampling
-
+    sampled_neg_idx = tf.stop_gradient(sampled_neg_idx)
     neg_loss = tf.gather(bce, sampled_neg_idx)
-
-    # Handle empty cases robustly
     parts = []
     if pos_loss.shape.rank is not None:
         parts.append(pos_loss)
     else:
         parts.append(tf.zeros([0], bce.dtype))
     parts.append(neg_loss)
-
     total = tf.concat(parts, axis=0)
     return tf.reduce_mean(total)
 
 def bce_loss(y_true, y_pred):
     return tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
-    # return 0
 
 def tversky_loss(y_true, y_pred, alpha=0.4, beta=0.6, smooth=1e-6):
     y_true_f = tf.reshape(y_true, [-1])
@@ -297,62 +299,89 @@ def offset_loss(y_true, y_pred, mask):
     diff = (y_true - y_pred) * mask
     return tf.reduce_sum(tf.abs(diff)) / (tf.reduce_sum(mask) + 1e-6)
 
+def seg_loss(y_true, y_pred, w_bce=1.0, w_dice=1.0):
+    return w_bce * bce_loss(y_true, y_pred) + w_dice * dice_loss(y_true, y_pred)
+
 # ============= Training =============
 
 def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkpoints"):
-    optimizer = keras.optimizers.Adam(1e-3)
+    optimizer = keras.optimizers.Adam(LEARNING_RATE)
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_loss = float("inf")
 
-    def l1_loss(y_true, y_pred):
-        # return tversky_loss(y_true, y_pred) + 10 * focal_loss(y_true, y_pred)
-        # return 10 * bce_loss(y_true, y_pred) + dice_loss(y_true, y_pred)
-        return bce_loss(y_true, y_pred)
-        # return sampled_bce_loss(y_true, y_pred, 128 * 4) # number of negatives to sample
+    def l1_loss(y_true, y_pred):  # heatmap
+        return 100*bce_loss(y_true, y_pred)
 
-    def l2_loss(offs_true, offs_pred, mask):
+    def l2_loss(offs_true, offs_pred, mask):  # offsets
         return 0.0 * offset_loss(offs_true, offs_pred, mask)
 
+    def l3_loss(seg_true, seg_pred):  # segmentation
+        return seg_loss(seg_true, seg_pred, w_bce=1.0, w_dice=1.0)
+
+    train_losses = []
+    val_losses = []
+    import matplotlib.pyplot as plt
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(8, 5))
     for epoch in range(epochs):
-        hm_losses, off_losses = [], []
+        train_dataset.on_epoch_end()
+        val_dataset.on_epoch_end()
+
+        hm_losses, off_losses, seg_losses = [], [], []
         print(f"\nEpoch {epoch+1}/{epochs}")
         sleep(1)
 
         for imgs, targets in tqdm(train_dataset, desc='Training', leave=True):
             hms_true = targets['heatmap']
             offs_true = targets['offsets']
-            mask = targets['mask']
+            mask      = targets['mask']
+            seg_true  = targets['segmask']
             with tf.GradientTape() as tape:
-                hms_pred, offs_pred = model(imgs, training=True)
-                # training
+                hms_pred, offs_pred, seg_pred = model(imgs, training=True)
                 l1 = l1_loss(hms_true, hms_pred)
                 l2 = l2_loss(offs_true, offs_pred, mask)
-                loss = l1 + l2
+                l3 = l3_loss(seg_true, seg_pred)
+                loss = l1 + l2 + l3
             grads = tape.gradient(loss, model.trainable_weights)
             optimizer.apply_gradients(zip(grads, model.trainable_weights))
-            hm_losses.append(l1.numpy())
-            off_losses.append(l2.numpy())
+            hm_losses.append(float(l1)); off_losses.append(float(l2)); seg_losses.append(float(l3))
         mean_hm_loss = np.mean(hm_losses)
         mean_off_loss = np.mean(off_losses)
-        mean_loss = mean_hm_loss + mean_off_loss
+        mean_seg_loss = np.mean(seg_losses)
+        mean_loss = mean_hm_loss + mean_off_loss + mean_seg_loss
+        train_losses.append(mean_loss)
 
-        val_hm_losses, val_off_losses = [], []
+        val_hm_losses, val_off_losses, val_seg_losses = [], [], []
         for imgs, targets in tqdm(val_dataset, desc='Validation', leave=True):
             hms_true = targets['heatmap']
             offs_true = targets['offsets']
-            mask = targets['mask']
-            hms_pred, offs_pred = model(imgs, training=False)
-            # validation !!
+            mask      = targets['mask']
+            seg_true  = targets['segmask']
+            hms_pred, offs_pred, seg_pred = model(imgs, training=False)
             l1 = l1_loss(hms_true, hms_pred)
             l2 = l2_loss(offs_true, offs_pred, mask)
-            val_hm_losses.append(l1.numpy())
-            val_off_losses.append(l2.numpy())
+            l3 = l3_loss(seg_true, seg_pred)
+            val_hm_losses.append(float(l1)); val_off_losses.append(float(l2)); val_seg_losses.append(float(l3))
         mean_val_hm_loss = np.mean(val_hm_losses)
         mean_val_off_loss = np.mean(val_off_losses)
-        mean_val_loss = mean_val_hm_loss + mean_val_off_loss
+        mean_val_seg_loss = np.mean(val_seg_losses)
+        mean_val_loss = mean_val_hm_loss + mean_val_off_loss + mean_val_seg_loss
+        val_losses.append(mean_val_loss)
 
-        print(f"Train: hm_loss={mean_hm_loss:.4f}, off_loss={mean_off_loss:.4f}, total_loss={mean_loss:.4f} | "
-              f"Val: hm_loss={mean_val_hm_loss:.4f}, off_loss={mean_val_off_loss:.4f}, total_loss={mean_val_loss:.4f}")
+        ax.clear()
+        ax.plot(train_losses, label='Train Loss')
+        ax.plot(val_losses, label='Validation Loss')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training and Validation Loss')
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        plt.draw()
+        plt.pause(0.1)
+
+        print(f"Train: hm_loss={mean_hm_loss:.4f}, off_loss={mean_off_loss:.4f}, seg_loss={mean_seg_loss:.4f}, total_loss={mean_loss:.4f} | "
+              f"Val: hm_loss={mean_val_hm_loss:.4f}, off_loss={mean_val_off_loss:.4f}, seg_loss={mean_val_seg_loss:.4f}, total_loss={mean_val_loss:.4f}")
 
         if mean_val_loss < best_loss:
             best_loss = mean_val_loss
@@ -360,7 +389,8 @@ def train(model, train_dataset, val_dataset, epochs=15, checkpoint_dir="./checkp
             model.save(os.path.join(checkpoint_dir, "best.h5"))
 
         sleep(5)
-
+    plt.ioff()
+    plt.show()
     return model
 
 # ============= Evaluation =============
@@ -370,9 +400,10 @@ def infer_and_show(model, img_path, kp_true):
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_resized, kps_rescaled = kpu.resize_img_and_kps(img_rgb, kp_true, IMG_SIZE)
     inp = np.expand_dims(img_resized / 255.0, 0)
-    hm_pred, off_pred = model.predict(inp)
+    hm_pred, off_pred, seg_pred = model.predict(inp)
     hm_pred = hm_pred[0]
     off_pred = off_pred[0]
+    seg_pred = seg_pred[0, ..., 0]
 
     hm_exp = np.expand_dims(hm_pred[...,0], -1)
     rec_kps = kpu.reconstruct_keypoints(hm_exp, off_pred, threshold=0.5)
@@ -389,35 +420,45 @@ def infer_and_show(model, img_path, kp_true):
     for kp in kps_rescaled:
         cv2.drawMarker(img_show, (int(kp[0]), int(kp[1])), (255,0,0), markerType=cv2.MARKER_CROSS, thickness=2)
 
+    seg_up = cv2.resize(seg_pred, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+    seg_color = cv2.applyColorMap((seg_up*255).astype(np.uint8), cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(img_show, 0.7, seg_color, 0.3, 0)
+
     import matplotlib.pyplot as plt
-    plt.imshow(img_show)
-    plt.title("Green: Predicted, Blue: GT (rescaled)")
+    plt.imshow(overlay)
+    plt.title("Green: Predicted, Blue: GT (rescaled) | Seg overlay")
     plt.show()
 
 def show_heatmap_comparison(img_path, keypoints, model):
+    import matplotlib.pyplot as plt
+
     img = cv2.imread(img_path)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_resized, kps_rescaled = kpu.resize_img_and_kps(img_rgb, keypoints, IMG_SIZE)
-    inp = np.expand_dims(img_resized / 255.0, 0)
-    hm_pred, _ = model.predict(inp)
-    hm_pred = hm_pred[0,...,0]
-    hm_gt, _, _ = kpu.generate_targets(kps_rescaled)
 
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(img_resized)
-    axes[0].set_title("Input Image")
-    axes[1].imshow(hm_gt[...,0], cmap='hot')
-    axes[1].set_title("GT Heatmap")
-    axes[2].imshow(hm_pred, cmap='hot')
-    axes[2].set_title("Predicted Heatmap")
+    inp = np.expand_dims(img_resized / 255.0, 0)
+    hm_pred, _, seg_pred = model.predict(inp)
+    hm_pred = hm_pred[0, ..., 0]
+    seg_pred = seg_pred[0, ..., 0]
+
+    hm_gt, _, _, seg_gt = kpu.generate_targets(kps_rescaled)
+    hm_gt = hm_gt[..., 0]
+    seg_gt = seg_gt[..., 0]
+
+    fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+    axes[0].imshow(img_resized); axes[0].set_title("Input"); axes[0].axis('off')
+    axes[1].imshow(hm_gt, cmap='hot'); axes[1].set_title("GT Heatmap"); axes[1].axis('off')
+    axes[2].imshow(hm_pred, cmap='hot'); axes[2].set_title("Pred Heatmap"); axes[2].axis('off')
+    axes[3].imshow(seg_gt, cmap='gray'); axes[3].set_title("GT Seg"); axes[3].axis('off')
+    axes[4].imshow(seg_pred, cmap='jet'); axes[4].set_title("Pred Seg"); axes[4].axis('off')
+    plt.tight_layout()
     plt.show()
 
 # ============= Preview Augmented Dataset =============
 
 def preview_augmented_dataset(dataset):
     print("Previewing augmented dataset (ESC to quit, any key for next)...")
-    for img, kps, hm, off, mask in dataset.single_samples():
+    for img, kps, hm, off, mask, seg in dataset.single_samples():
         img_disp = img.astype(np.uint8).copy()
         for kp in kps:
             cv2.drawMarker(img_disp, (int(kp[0]), int(kp[1])), (0,255,0), markerType=cv2.MARKER_CROSS, thickness=2, line_type=cv2.LINE_AA)
@@ -426,9 +467,14 @@ def preview_augmented_dataset(dataset):
         heat_disp = cv2.applyColorMap(heat_disp, cv2.COLORMAP_JET)
         heat_disp = cv2.resize(heat_disp, (img_disp.shape[1], img_disp.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-        stacked = np.hstack([cv2.cvtColor(img_disp, cv2.COLOR_RGB2BGR), heat_disp])
+        seg_disp = (seg[...,0] * 255).astype(np.uint8)
+        seg_disp = cv2.resize(seg_disp, (img_disp.shape[1], img_disp.shape[0]), interpolation=cv2.INTER_NEAREST)
+        seg_color = cv2.applyColorMap(seg_disp, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(cv2.cvtColor(img_disp, cv2.COLOR_RGB2BGR), 0.7, seg_color, 0.3, 0)
 
-        cv2.imshow("Image (left) + Heatmap (right). ESC to quit, any key for next.", stacked)
+        stacked = np.hstack([cv2.cvtColor(img_disp, cv2.COLOR_RGB2BGR), heat_disp, overlay])
+
+        cv2.imshow("Image | Heatmap | Seg overlay. ESC to quit.", stacked)
         key = cv2.waitKey(0)
         if key == 27:
             cv2.destroyAllWindows()
@@ -438,31 +484,27 @@ def preview_augmented_dataset(dataset):
 # ============= MAIN =============
 
 def main():
-    parser = argparse.ArgumentParser(description='Board keypoint detector training and evaluation.')
-    parser.add_argument('--annotations', type=str, default='annotations.txt')
-    parser.add_argument('--images', type=str, default='files')
-    parser.add_argument('--epochs', type=int, default=12)
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--detections', type=int, default=5)
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser(description='Board keypoint detector training and evaluation.')
+    # parser.add_argument('--annotations', type=str, default='annotations.txt')
+    # parser.add_argument('--images', type=str, default='files')
+    # parser.add_argument('--epochs', type=int, default=12)
+    # parser.add_argument('--batch_size', type=int, default=4)
+    # parser.add_argument('--detections', type=int, default=5)
+    # args = parser.parse_args()
 
-    img_paths, keypoints = kpu.parse_annotations(args.annotations, args.images)
+    img_paths, keypoints = kpu.parse_annotations(ANNOTATIONS_PATH, IMAGES_PATH)
 
-    # --- Split into train/validation ---
     train_imgs, val_imgs, train_kps, val_kps = train_test_split(
-        img_paths, keypoints, test_size=0.2, random_state=42
+        img_paths, keypoints, test_size=0.3, random_state=42
     )
 
-    train_ds = BoardDataset(train_imgs, train_kps, batch_size=args.batch_size, augmentations=AUGMENTATIONS)
-    val_ds = BoardDataset(val_imgs, val_kps, batch_size=args.batch_size, augmentations=[identity], num_iterations=0)
+    train_ds = BoardDataset(train_imgs, train_kps, batch_size=BATCH_SIZE, augmentations=AUGMENTATIONS, num_iterations=5)
+    val_ds = BoardDataset(val_imgs, val_kps, batch_size=BATCH_SIZE, augmentations=[identity], num_iterations=0)
 
-    # --- Preview some augmentations ---
     preview_augmented_dataset(train_ds)
 
-    # --- Build model ---
     model = build_model()
 
-    # --- Load checkpoint if exists ---
     if os.path.exists(CHECKPOINT_PATH):
         try:
             model.load_weights(CHECKPOINT_PATH)
@@ -472,19 +514,16 @@ def main():
     else:
         print("No checkpoint found, training from scratch.")
 
-    # --- Train ---
-    model = train(model, train_ds, val_ds, epochs=args.epochs)
+    model = train(model, train_ds, val_ds, epochs=EPOCHS)
 
-    # --- Save weights ---
     model.save(CHECKPOINT_PATH)
     print(f"Model weights saved to {CHECKPOINT_PATH}")
 
-    # --- Evaluate ---
-    show_indices = random.sample(range(len(img_paths)), min(args.detections, len(img_paths)))
-    for idx in show_indices:
-        print(f"Detection on: {img_paths[idx]}")
-        infer_and_show(model, img_paths[idx], keypoints[idx])
-        show_heatmap_comparison(img_paths[idx], keypoints[idx], model)
+    max_vis = min(DETECTIONS, len(val_imgs))
+    for i in range(max_vis):
+        print(f"Validation sample {i + 1}/{max_vis}: {val_imgs[i]}")
+        infer_and_show(model, val_imgs[i], val_kps[i])
+        show_heatmap_comparison(val_imgs[i], val_kps[i], model)
 
 if __name__ == "__main__":
     main()
