@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 IMG_SIZE = 512
 HEATMAP_DOWNSAMPLE = 8
 HM_SIZE = IMG_SIZE // HEATMAP_DOWNSAMPLE
-HEATMAP_SIGMA = 4
+# HEATMAP_SIGMA = 4
 NUM_CORNERS = 4
 
 
@@ -47,34 +47,75 @@ def _order_quad(pts):
     bl, br = bot2[np.argsort(bot2[:, 0])]
     return np.stack([tl, tr, br, bl], axis=0)
 
-def generate_targets(kps, img_size=IMG_SIZE, hm_size=HM_SIZE):
+# def generate_targets(kps, img_size=IMG_SIZE, hm_size=HM_SIZE):
+#     assert kps.shape == (4, 2), "need 4 keypoints"
+#
+#     heatmap = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
+#     offsets = np.zeros((hm_size, hm_size, 2), dtype=np.float32)
+#     offsetmask = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
+#     mask = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
+#
+#     scale = hm_size / float(img_size)
+#
+#     # Ordered quad in heatmap coords
+#     poly_hm = _order_quad(kps) * scale  # (4,2) float
+#     poly_i = np.round(poly_hm).astype(np.int32)
+#
+#     # Fill polygon into seg_mask[:,:,0]
+#     cv2.fillPoly(mask[:, :, 0], [poly_i], 1.0)
+#
+#     # Keypoint targets (set only the nearest cell for each keypoint)
+#     for fx, fy in poly_hm:
+#         nx = int(round(fx))
+#         ny = int(round(fy))
+#         for dx in [-1, 0, 1]:
+#             for dy in [-1, 0, 1]:
+#                 x = nx + dx
+#                 y = ny + dy
+#                 if 0 <= x < hm_size and 0 <= y < hm_size:
+#                     heatmap[y, x, 0] = 1.0
+#                     offsets[y, x, 0] = fx - x
+#                     offsets[y, x, 1] = fy - y
+#                     offsetmask[y, x, 0] = 1.0
+#     #
+#     # print("asdfadsgadsg")
+#     # cv2.imshow("ii", heatmap)
+#     # cv2.waitKey(1)
+#
+#     return heatmap, offsets, offsetmask, mask
+
+
+## gaussian version
+def generate_targets(kps, img_size=IMG_SIZE, hm_size=HM_SIZE, sigma=2.0):
+    assert kps.shape == (4, 2), "need 4 keypoints"
+
     heatmap = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
     offsets = np.zeros((hm_size, hm_size, 2), dtype=np.float32)
     offsetmask = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
     mask = np.zeros((hm_size, hm_size, 1), dtype=np.float32)
 
     scale = hm_size / float(img_size)
-
-    # Ordered quad in heatmap coords
-    poly_hm = _order_quad(kps) * scale  # (4,2) float
+    poly_hm = _order_quad(kps) * scale
     poly_i = np.round(poly_hm).astype(np.int32)
-
-    # Fill polygon into seg_mask[:,:,0]
     cv2.fillPoly(mask[:, :, 0], [poly_i], 1.0)
 
-    # Keypoint targets (same as before, use hm coords)
+    # Generate Gaussian for each keypoint
     for fx, fy in poly_hm:
-        ix0 = int(np.floor(fx))
-        iy0 = int(np.floor(fy))
-        for dx in (0, 1):
-            for dy in (0, 1):
-                nx = ix0 + dx
-                ny = iy0 + dy
-                if 0 <= nx < hm_size and 0 <= ny < hm_size:
-                    heatmap[ny, nx, 0] = 1.0
-                    offsets[ny, nx, 0] = fx - nx
-                    offsets[ny, nx, 1] = fy - ny
-                    offsetmask[ny, nx, 0] = 1.0
+        nx = int(round(fx))
+        ny = int(round(fy))
+        if 0 <= nx < hm_size and 0 <= ny < hm_size:
+            # Create Gaussian blob
+            y_grid, x_grid = np.ogrid[:hm_size, :hm_size]
+            dist_sq = (x_grid - fx) ** 2 + (y_grid - fy) ** 2
+            gaussian = np.exp(-dist_sq / (2 * sigma ** 2))
+
+            # Max operation to handle overlapping Gaussians
+            heatmap[:, :, 0] = np.maximum(heatmap[:, :, 0], gaussian)
+
+            # Offsets only at peak
+            offsets[ny, nx, 0] = max(min(fx - nx, 1.0), -1.0)
+            offsets[ny, nx, 1] = max(min(fy - ny, 1.0), -1.0)
+            offsetmask[ny, nx, 0] = 1.0
 
     return heatmap, offsets, offsetmask, mask
 
@@ -136,6 +177,39 @@ def visualize_offsets(img, hm, off, title_prefix=""):
     plt.show()
 
 
+def test_generate_and_reconstruct():
+    """
+    Automated test: generate targets from synthetic keypoints, reconstruct them, and check accuracy.
+    """
+    print("Running automated test: generate_targets -> reconstruct_keypoints")
+    # Synthetic quad (square in image coordinates)
+    kps = np.array([
+        [50, 50],    # top-left
+        [462, 50],   # top-right
+        [462, 462],  # bottom-right
+        [50, 462]    # bottom-left
+    ], dtype=np.float32)
+    hm, off, _, _ = generate_targets(kps)
+    rec_kps = reconstruct_keypoints(hm, off, threshold=0.5)
+    # Order reconstructed points for comparison
+    rec_kps = np.array(rec_kps, dtype=np.float32)
+    if len(rec_kps) != 4:
+        print(f"FAIL: Expected 4 keypoints, got {len(rec_kps)}")
+        return False
+    # Order both sets for comparison
+    kps_ordered = _order_quad(kps)
+    rec_ordered = _order_quad(rec_kps)
+    # Compare positions
+    errors = np.linalg.norm(kps_ordered - rec_ordered, axis=1)
+    print(f"Keypoint errors: {errors}")
+    tol = 1.0  # pixel tolerance
+    if np.all(errors < tol):
+        print("PASS: All reconstructed keypoints are within tolerance.")
+        return True
+    else:
+        print("FAIL: Some keypoints differ by more than tolerance.")
+        return False
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Visualize keypoint dataset for board detection.')
@@ -154,4 +228,5 @@ def main():
         visualize_offsets(img_resized, hm, off, title_prefix=f"Sample {i+1}: ")
 
 if __name__ == "__main__":
+    test_generate_and_reconstruct()
     main()

@@ -1,15 +1,17 @@
 import os
+import torch
 import numpy as np
 import cv2
-import tensorflow as tf
 import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
 import keypoint_utils
+from board_keypoint_learn import KeypointNet
+from model import BoardKeypointNet
 
 # ==== USER-EDITABLE PARAMETERS (model + folders only!) ====
 # MODEL_PATH      = "board_keypoint_detector.h5"
-MODEL_PATH      = "checkpoints/best.h5"
+MODEL_PATH      = "checkpoints/best.pt"
 IMG_FOLDER      = "files"
 HEATMAP_THRESH  = 0.85   # Minimum probability for blob detection
 SHOW_MAX_IMAGES = 50
@@ -40,14 +42,13 @@ def get_blob_peaks(labeled, num, hm):
     return blob_props
 
 def predict_corners(model, img_resized):
-    inp = img_resized / 255.0
-    inp = np.expand_dims(inp, 0)
-    # Get all three outputs: heatmap, offsets, segmentation
-    outputs = model.predict(inp)
+    inp = torch.from_numpy(img_resized).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    with torch.no_grad():
+        outputs = model(inp)
     hm_pred, off_pred, seg_pred = outputs
-    seg_pred = seg_pred[0, ..., 0]
-    hm_pred = hm_pred[0, ..., 0]
-    off_pred = off_pred[0]
+    hm_pred = hm_pred.squeeze().cpu().numpy()
+    off_pred = off_pred.squeeze().cpu().numpy()
+    seg_pred = seg_pred.squeeze().cpu().numpy()
 
     labeled, num = blobs_from_heatmap(hm_pred, min_prob=HEATMAP_THRESH)
     blobs = get_blob_peaks(labeled, num, hm_pred)
@@ -55,7 +56,7 @@ def predict_corners(model, img_resized):
     corners = []
     for blob in blobs[:keypoint_utils.NUM_CORNERS]:
         x, y = blob['peak_x'], blob['peak_y']
-        ox, oy = off_pred[y, x]
+        ox, oy = off_pred[:, y, x]
         fx = (x + ox) * keypoint_utils.IMG_SIZE / keypoint_utils.HM_SIZE
         fy = (y + oy) * keypoint_utils.IMG_SIZE / keypoint_utils.HM_SIZE
         rx = int(round(fx))
@@ -84,12 +85,13 @@ def visualize_all(img, img_resized, hm_pred, labeled, corners, fname, seg_pred=N
     axes[3].set_title(f"Predicted Corners ({len(corners)} blobs)")
     axes[3].axis('off')
 
-    seg_up = cv2.resize(seg_pred, (img_resized.shape[1], img_resized.shape[0]), interpolation=cv2.INTER_NEAREST)
-    seg_color = cv2.applyColorMap((seg_up*255).astype(np.uint8), cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR), 0.7, seg_color, 0.3, 0)
-    axes[4].imshow(overlay)
-    axes[4].set_title("Segmentation Overlay")
-    axes[4].axis('off')
+    if seg_pred is not None:
+        seg_up = cv2.resize(seg_pred, (img_resized.shape[1], img_resized.shape[0]), interpolation=cv2.INTER_NEAREST)
+        seg_color = cv2.applyColorMap((seg_up*255).astype(np.uint8), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR), 0.7, seg_color, 0.3, 0)
+        axes[4].imshow(overlay)
+        axes[4].set_title("Segmentation Overlay")
+        axes[4].axis('off')
 
     plt.suptitle(f"Results for {fname}")
     plt.tight_layout()
@@ -97,7 +99,11 @@ def visualize_all(img, img_resized, hm_pred, labeled, corners, fname, seg_pred=N
 
 def main():
     print(f"Loading model from {MODEL_PATH} ...")
-    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    # model = KeypointNet()
+    model = BoardKeypointNet()
+    state_dict = torch.load(MODEL_PATH, map_location='cpu')
+    model.load_state_dict(state_dict)
+    model.eval()
     print("Model loaded.")
 
     exts = ['.png', '.jpg', '.jpeg', '.bmp']
