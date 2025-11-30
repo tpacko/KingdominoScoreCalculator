@@ -124,22 +124,29 @@ class TileNet(nn.Module):
     def __init__(self, num_tile_classes, num_crown_classes):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 64x64
+
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 32x32
+
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 16x16
+
+            nn.AdaptiveAvgPool2d((4, 4)),  # Flexible pooling
             nn.Flatten()
         )
         self.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(128 * (IMG_SIZE // 16) * (IMG_SIZE // 16), 256),
+            nn.Linear(128 * 4 * 4, 512),
             nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, 256),
-            nn.ReLU()
+            nn.Dropout(0.3)
         )
-        self.tile_head = nn.Linear(256, num_tile_classes)
-        self.crown_head = nn.Linear(256, num_crown_classes)
+        self.tile_head = nn.Linear(512, num_tile_classes)
+        self.crown_head = nn.Linear(512, num_crown_classes)
+
     def forward(self, x):
         x = self.features(x)
         x = self.fc(x)
