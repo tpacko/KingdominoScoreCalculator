@@ -1,14 +1,17 @@
 import os
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.utils import to_categorical
-from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
+from PIL import Image
 import random
 from collections import defaultdict
 import cv2
+from torchvision import transforms
+import matplotlib.pyplot as plt
+import matplotlib
 
 # -------------------------------
 # CONFIGURATION
@@ -87,99 +90,66 @@ def load_tile_images(folder, min_images_per_class=1):
 
     return np.array(balanced_images), np.array(tile_labels), np.array(crown_labels)
 
-def add_transparent_overlay(image):
-    pil_img = Image.fromarray((image * 255).astype(np.uint8))
-    overlay = Image.new('RGBA', pil_img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    color = (255, 255, 255, random.randint(20, 60)) if random.random() < 0.5 else (0, 0, 0, random.randint(20, 60))
-    shape = [(random.randint(0, IMG_SIZE//2), random.randint(0, IMG_SIZE//2)),
-             (random.randint(IMG_SIZE//2, IMG_SIZE), random.randint(IMG_SIZE//2, IMG_SIZE))]
-    draw.rectangle(shape, fill=color)
-    combined = Image.alpha_composite(pil_img.convert('RGBA'), overlay)
-    return np.array(combined.convert('RGB')) / 255.0
-
-def augment_image(img):
-    img = tf.convert_to_tensor(img, dtype=tf.float32)
-    k = tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32)
-    img = tf.image.rot90(img, k=k)
-    img = tf.image.random_hue(img, 0.05)
-    img = tf.image.random_saturation(img, 0.6, 1.2)
-    img = tf.image.random_brightness(img, 0.15)
-    img = tf.clip_by_value(img, 0, 1)
-    img_np = img.numpy()
-    # return add_transparent_overlay(img_np)
-    return img_np
-
-def augment_batch(batch):
-    return np.array([augment_image(img) for img in batch])
+class TileDataset(Dataset):
+    def __init__(self, images, tile_labels, crown_labels, augment=False):
+        self.images = images
+        self.tile_labels = tile_labels
+        self.crown_labels = crown_labels
+        self.augment = augment
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomApply([
+                transforms.RandomRotation(90),
+                transforms.ColorJitter(brightness=0.15, hue=0.05, saturation=0.6),
+            ], p=0.7),
+            transforms.ToTensor()
+        ])
+    def __len__(self):
+        return len(self.images)
+    def __getitem__(self, idx):
+        img = (self.images[idx] * 255).astype(np.uint8)
+        if self.augment:
+            img = self.transform(img)
+        else:
+            img = torch.tensor(self.images[idx].transpose(2, 0, 1), dtype=torch.float32)
+        tile_label = int(self.tile_labels[idx])
+        crown_label = int(self.crown_labels[idx])
+        return img, tile_label, crown_label
 
 # -------------------------------
 # MODEL DEFINITION
 # -------------------------------
 
-def conv_block(x, filters, kernel=3, residual=False):
-    shortcut = x
-    x = layers.Conv2D(filters, kernel, padding='same')(x)
-    # x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU()(x)
-    x = layers.Conv2D(filters, kernel, padding='same')(x)
-    # x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU()(x)
-    # x = layers.Conv2D(filters, kernel, padding='same')(x)
-    # x = layers.BatchNormalization()(x)
-    # x = layers.LeakyReLU()(x)
-    # x = layers.Conv2D(filters, kernel, padding='same')(x)
-    # x = layers.BatchNormalization()(x)
-
-    if residual:
-        shortcut = layers.Conv2D(filters, 1, padding='same')(shortcut)
-        # shortcut = layers.BatchNormalization()(shortcut)
-        x = layers.add([x, shortcut])
-
-    x = layers.LeakyReLU()(x)
-    x = layers.MaxPooling2D()(x)
-    return x
-
-
-def build_model():
-    inp = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-
-    x = conv_block(inp, 16, residual=False)
-    x = conv_block(x, 32, residual=True)
-    x = conv_block(x, 64, residual=True)
-
-    # x = layers.GlobalAveragePooling2D()(x)
-
-    # x = layers.Conv2D(32, 5, activation='relu', padding='same')(inp)
-    # x = layers.MaxPooling2D()(x)
-    # x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
-    # x = layers.MaxPooling2D()(x)
-    # x = layers.Conv2D(128, 3, activation='relu', padding='same')(x)
-    # x = layers.MaxPooling2D()(x)
-    # x = layers.Conv2D(256, 3, activation='relu', padding='same')(x)
-    # x = layers.MaxPooling2D()(x)
-    # x = layers.Conv2D(512, 3, activation='relu', padding='same')(x)
-
-    x = layers.MaxPooling2D()(x)
-    x = layers.Flatten()(x)
-
-    # x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Dense(256, activation='relu')(x)
-    # x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Dense(256, activation='relu')(x)
-
-    tile_type = layers.Dense(len(TILE_CLASSES), activation='softmax', name='tile_type')(x)
-    crown_count = layers.Dense(len(CROWN_CLASSES), activation='softmax', name='crown_count')(x)
-
-    model = models.Model(inputs=inp, outputs=[tile_type, crown_count])
-    return model
+class TileNet(nn.Module):
+    def __init__(self, num_tile_classes, num_crown_classes):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.LeakyReLU(), nn.MaxPool2d(2),
+            nn.Flatten()
+        )
+        self.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(128 * (IMG_SIZE // 16) * (IMG_SIZE // 16), 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 256),
+            nn.ReLU()
+        )
+        self.tile_head = nn.Linear(256, num_tile_classes)
+        self.crown_head = nn.Linear(256, num_crown_classes)
+    def forward(self, x):
+        x = self.features(x)
+        x = self.fc(x)
+        tile_logits = self.tile_head(x)
+        crown_logits = self.crown_head(x)
+        return tile_logits, crown_logits
 
 # -------------------------------
 # MAIN FUNCTION
 # -------------------------------
-
 
 def draw_label(img, text, pos=(5, 20)):
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -191,31 +161,33 @@ def draw_label(img, text, pos=(5, 20)):
     return img
 
 def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     images, tile_labels, crown_labels = load_tile_images('tiles', min_images_per_class=1)
-    tile_labels_cat = to_categorical(tile_labels, num_classes=len(TILE_CLASSES))
-    crown_labels_cat = to_categorical(crown_labels, num_classes=len(CROWN_CLASSES))
-
     X_train, X_val, y_tile_train, y_tile_val, y_crown_train, y_crown_val = train_test_split(
-        images, tile_labels_cat, crown_labels_cat, test_size=0.05, random_state=42
+        images, tile_labels, crown_labels, test_size=0.05, random_state=42
     )
+    train_ds = TileDataset(X_train, y_tile_train, y_crown_train, augment=True)
+    val_ds = TileDataset(X_val, y_tile_val, y_crown_val, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = TileNet(len(TILE_CLASSES), len(CROWN_CLASSES)).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
 
     # --- Interactive periodic preview of 9 random augmented images with labels (OpenCV) ---
-    n_samples = len(X_train)
+    n_samples = len(train_ds)
     indices = list(range(n_samples))
     batch_size = 9
     stop_preview = False
-
     while not stop_preview:
         rand_idxs = random.sample(indices, min(batch_size, n_samples))
         imgs = []
         for idx in rand_idxs:
-            aug_img = augment_image(X_train[idx])
-            tile_idx = np.argmax(y_tile_train[idx])
-            crown_idx = np.argmax(y_crown_train[idx])
+            img, tile_idx, crown_idx = train_ds[idx]
             tile_name = CODE2TERR[TILE_CLASSES[tile_idx]]
             label = f"{tile_name}, {CROWN_CLASSES[crown_idx]}c"
-            # Prepare for cv2: float32->uint8, RGB->BGR
-            img_disp = (aug_img * 255).astype(np.uint8)
+            img_disp = (img.permute(1,2,0).numpy() * 255).astype(np.uint8)
             img_disp = cv2.cvtColor(img_disp, cv2.COLOR_RGB2BGR)
             img_disp = draw_label(img_disp, label)
             imgs.append(img_disp)
@@ -237,61 +209,119 @@ def main():
     print("Continuing to learning...")
 
     # --------- Model Training ---------
-    def train_gen():
-        idxs = np.arange(len(X_train))
-        while True:
-            np.random.shuffle(idxs)
-            for start in range(0, len(idxs), BATCH_SIZE):
-                end = min(start + BATCH_SIZE, len(idxs))
-                batch_idx = idxs[start:end]
-                if random.random() < 0.6:
-                    batch_x = augment_batch(X_train[batch_idx])
-                else:
-                    batch_x = X_train[batch_idx]
-                batch_y_tile = y_tile_train[batch_idx]
-                batch_y_crown = y_crown_train[batch_idx]
-                yield batch_x, {'tile_type': batch_y_tile, 'crown_count': batch_y_crown}
+    matplotlib.use('TkAgg')
+    plt.ion()
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    train_losses, val_losses = [], []
+    train_acc_tile_hist, val_acc_tile_hist = [], []
+    train_acc_crown_hist, val_acc_crown_hist = [], []
 
-    steps_per_epoch = int(np.ceil(len(X_train) / BATCH_SIZE))
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss, train_acc_tile, train_acc_crown = 0, 0, 0
+        for imgs, tile_targets, crown_targets in train_loader:
+            imgs = imgs.to(device)
+            tile_targets = torch.as_tensor(tile_targets, dtype=torch.long, device=device)
+            crown_targets = torch.as_tensor(crown_targets, dtype=torch.long, device=device)
+            optimizer.zero_grad()
+            tile_logits, crown_logits = model(imgs)
+            loss_tile = criterion(tile_logits, tile_targets)
+            loss_crown = criterion(crown_logits, crown_targets)
+            loss = loss_tile + loss_crown
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * imgs.size(0)
+            train_acc_tile += (tile_logits.argmax(1).cpu() == tile_targets.cpu()).float().sum().item()
+            train_acc_crown += (crown_logits.argmax(1).cpu() == crown_targets.cpu()).float().sum().item()
+        train_loss /= len(train_ds)
+        train_acc_tile /= len(train_ds)
+        train_acc_crown /= len(train_ds)
 
-    model = build_model()
-    model.compile(
-        optimizer='adam',
-        loss={'tile_type': 'categorical_crossentropy', 'crown_count': 'categorical_crossentropy'},
-        metrics={'tile_type': 'accuracy', 'crown_count': 'accuracy'}
-    )
+        # Validation
+        model.eval()
+        val_loss, val_acc_tile, val_acc_crown = 0, 0, 0
+        with torch.no_grad():
+            for imgs, tile_targets, crown_targets in val_loader:
+                imgs = imgs.to(device)
+                tile_targets = torch.as_tensor(tile_targets, dtype=torch.long, device=device)
+                crown_targets = torch.as_tensor(crown_targets, dtype=torch.long, device=device)
+                tile_logits, crown_logits = model(imgs)
+                loss_tile = criterion(tile_logits, tile_targets)
+                loss_crown = criterion(crown_logits, crown_targets)
+                loss = loss_tile + loss_crown
+                val_loss += loss.item() * imgs.size(0)
+                val_acc_tile += (tile_logits.argmax(1).cpu() == tile_targets.cpu()).float().sum().item()
+                val_acc_crown += (crown_logits.argmax(1).cpu() == crown_targets.cpu()).float().sum().item()
+        val_loss /= len(val_ds)
+        val_acc_tile /= len(val_ds)
+        val_acc_crown /= len(val_ds)
 
-    history = model.fit(
-        train_gen(),
-        steps_per_epoch=steps_per_epoch,
-        epochs=EPOCHS,
-        validation_data=(X_val, {'tile_type': y_tile_val, 'crown_count': y_crown_val}),
-        shuffle=True
-    )
-    model.save('tile_classifier.h5')
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_acc_tile_hist.append(train_acc_tile)
+        val_acc_tile_hist.append(val_acc_tile)
+        train_acc_crown_hist.append(train_acc_crown)
+        val_acc_crown_hist.append(val_acc_crown)
+
+        # Plotting
+        axs[0, 0].clear()
+        axs[0, 0].plot(train_losses, label='Train Loss')
+        axs[0, 0].plot(val_losses, label='Val Loss')
+        axs[0, 0].set_title('Total Loss')
+        axs[0, 0].set_xlabel('Epoch')
+        axs[0, 0].set_ylabel('Loss')
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+
+        axs[0, 1].clear()
+        axs[0, 1].plot(train_acc_tile_hist, label='Train Acc Tile')
+        axs[0, 1].plot(val_acc_tile_hist, label='Val Acc Tile')
+        axs[0, 1].set_title('Tile Accuracy')
+        axs[0, 1].set_xlabel('Epoch')
+        axs[0, 1].set_ylabel('Accuracy')
+        axs[0, 1].legend()
+        axs[0, 1].grid(True)
+
+        axs[1, 0].clear()
+        axs[1, 0].plot(train_acc_crown_hist, label='Train Acc Crown')
+        axs[1, 0].plot(val_acc_crown_hist, label='Val Acc Crown')
+        axs[1, 0].set_title('Crown Accuracy')
+        axs[1, 0].set_xlabel('Epoch')
+        axs[1, 0].set_ylabel('Accuracy')
+        axs[1, 0].legend()
+        axs[1, 0].grid(True)
+
+        axs[1, 1].axis('off')
+        fig.tight_layout()
+        plt.pause(0.1)
+
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"Train Acc Tile: {train_acc_tile:.3f} | Val Acc Tile: {val_acc_tile:.3f} | "
+              f"Train Acc Crown: {train_acc_crown:.3f} | Val Acc Crown: {val_acc_crown:.3f}")
+
+    plt.ioff()
+    plt.show()
+
+    torch.save(model.state_dict(), 'tile_classifier.pt')
     print('Training done and model saved!')
 
     print("Manual verification loop starting. Press ENTER to see next image, ESC to quit.")
-
-    for i in range(len(X_val)):
-        img = X_val[i]
-        img_display = (img * 255).astype(np.uint8)
+    for i in range(len(val_ds)):
+        img, tile_label, crown_label = val_ds[i]
+        img_display = (img.permute(1,2,0).numpy() * 255).astype(np.uint8)
         img_display = cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR)
-
-        # Predict
-        tile_pred, crown_pred = model.predict(img[None, ...], verbose=0)
-        tile_idx = np.argmax(tile_pred)
-        crown_idx = np.argmax(crown_pred)
-
+        with torch.no_grad():
+            model.eval()
+            tile_logits, crown_logits = model(img.unsqueeze(0).to(device))
+            tile_idx = tile_logits.argmax(1).item()
+            crown_idx = crown_logits.argmax(1).item()
         tile_name = CODE2TERR[TILE_CLASSES[tile_idx]]
         crown_val = CROWN_CLASSES[crown_idx]
         label = f"{tile_name}, {crown_val}c"
-
         img_display = draw_label(img_display, label)
         cv2.imshow("Validation Prediction", img_display)
-
         key = cv2.waitKey(0)
-        if key == 27:  # ESC
+        if key == 27:
             print("Exiting manual validation viewer.")
             cv2.destroyAllWindows()
             break
