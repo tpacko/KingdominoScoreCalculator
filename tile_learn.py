@@ -160,6 +160,69 @@ def draw_label(img, text, pos=(5, 20)):
     img = cv2.putText(img, text, pos, font, font_scale, color, thickness, cv2.LINE_AA)
     return img
 
+def run_epoch(model, loader, criterion, optimizer=None, device='cpu'):
+    is_train = optimizer is not None
+    if is_train:
+        model.train()
+    else:
+        model.eval()
+    total_loss, total_acc_tile, total_acc_crown = 0, 0, 0
+    total_samples = 0
+    for imgs, tile_targets, crown_targets in loader:
+        imgs = imgs.to(device)
+        tile_targets = torch.as_tensor(tile_targets, dtype=torch.long, device=device)
+        crown_targets = torch.as_tensor(crown_targets, dtype=torch.long, device=device)
+        if is_train:
+            optimizer.zero_grad()
+        tile_logits, crown_logits = model(imgs)
+        loss_tile = criterion(tile_logits, tile_targets)
+        loss_crown = criterion(crown_logits, crown_targets)
+        loss = loss_tile + loss_crown
+        if is_train:
+            loss.backward()
+            optimizer.step()
+        batch_size = imgs.size(0)
+        total_loss += loss.item() * batch_size
+        total_acc_tile += (tile_logits.argmax(1).cpu() == tile_targets.cpu()).float().sum().item()
+        total_acc_crown += (crown_logits.argmax(1).cpu() == crown_targets.cpu()).float().sum().item()
+        total_samples += batch_size
+    avg_loss = total_loss / total_samples
+    avg_acc_tile = total_acc_tile / total_samples
+    avg_acc_crown = total_acc_crown / total_samples
+    return avg_loss, avg_acc_tile, avg_acc_crown
+
+def plot_training_progress(axs, train_losses, val_losses, train_acc_tile_hist, val_acc_tile_hist, train_acc_crown_hist, val_acc_crown_hist):
+    axs[0, 0].clear()
+    axs[0, 0].plot(train_losses, label='Train Loss')
+    axs[0, 0].plot(val_losses, label='Val Loss')
+    axs[0, 0].set_title('Total Loss')
+    axs[0, 0].set_xlabel('Epoch')
+    axs[0, 0].set_ylabel('Loss')
+    axs[0, 0].legend()
+    axs[0, 0].grid(True)
+
+    axs[0, 1].clear()
+    axs[0, 1].plot(train_acc_tile_hist, label='Train Acc Tile')
+    axs[0, 1].plot(val_acc_tile_hist, label='Val Acc Tile')
+    axs[0, 1].set_title('Tile Accuracy')
+    axs[0, 1].set_xlabel('Epoch')
+    axs[0, 1].set_ylabel('Accuracy')
+    axs[0, 1].legend()
+    axs[0, 1].grid(True)
+
+    axs[1, 0].clear()
+    axs[1, 0].plot(train_acc_crown_hist, label='Train Acc Crown')
+    axs[1, 0].plot(val_acc_crown_hist, label='Val Acc Crown')
+    axs[1, 0].set_title('Crown Accuracy')
+    axs[1, 0].set_xlabel('Epoch')
+    axs[1, 0].set_ylabel('Accuracy')
+    axs[1, 0].legend()
+    axs[1, 0].grid(True)
+
+    axs[1, 1].axis('off')
+    plt.tight_layout()
+    plt.pause(0.1)
+
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     images, tile_labels, crown_labels = load_tile_images('tiles', min_images_per_class=1)
@@ -217,44 +280,8 @@ def main():
     train_acc_crown_hist, val_acc_crown_hist = [], []
 
     for epoch in range(EPOCHS):
-        model.train()
-        train_loss, train_acc_tile, train_acc_crown = 0, 0, 0
-        for imgs, tile_targets, crown_targets in train_loader:
-            imgs = imgs.to(device)
-            tile_targets = torch.as_tensor(tile_targets, dtype=torch.long, device=device)
-            crown_targets = torch.as_tensor(crown_targets, dtype=torch.long, device=device)
-            optimizer.zero_grad()
-            tile_logits, crown_logits = model(imgs)
-            loss_tile = criterion(tile_logits, tile_targets)
-            loss_crown = criterion(crown_logits, crown_targets)
-            loss = loss_tile + loss_crown
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * imgs.size(0)
-            train_acc_tile += (tile_logits.argmax(1).cpu() == tile_targets.cpu()).float().sum().item()
-            train_acc_crown += (crown_logits.argmax(1).cpu() == crown_targets.cpu()).float().sum().item()
-        train_loss /= len(train_ds)
-        train_acc_tile /= len(train_ds)
-        train_acc_crown /= len(train_ds)
-
-        # Validation
-        model.eval()
-        val_loss, val_acc_tile, val_acc_crown = 0, 0, 0
-        with torch.no_grad():
-            for imgs, tile_targets, crown_targets in val_loader:
-                imgs = imgs.to(device)
-                tile_targets = torch.as_tensor(tile_targets, dtype=torch.long, device=device)
-                crown_targets = torch.as_tensor(crown_targets, dtype=torch.long, device=device)
-                tile_logits, crown_logits = model(imgs)
-                loss_tile = criterion(tile_logits, tile_targets)
-                loss_crown = criterion(crown_logits, crown_targets)
-                loss = loss_tile + loss_crown
-                val_loss += loss.item() * imgs.size(0)
-                val_acc_tile += (tile_logits.argmax(1).cpu() == tile_targets.cpu()).float().sum().item()
-                val_acc_crown += (crown_logits.argmax(1).cpu() == crown_targets.cpu()).float().sum().item()
-        val_loss /= len(val_ds)
-        val_acc_tile /= len(val_ds)
-        val_acc_crown /= len(val_ds)
+        train_loss, train_acc_tile, train_acc_crown = run_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc_tile, val_acc_crown = run_epoch(model, val_loader, criterion, None, device)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -263,37 +290,11 @@ def main():
         train_acc_crown_hist.append(train_acc_crown)
         val_acc_crown_hist.append(val_acc_crown)
 
-        # Plotting
-        axs[0, 0].clear()
-        axs[0, 0].plot(train_losses, label='Train Loss')
-        axs[0, 0].plot(val_losses, label='Val Loss')
-        axs[0, 0].set_title('Total Loss')
-        axs[0, 0].set_xlabel('Epoch')
-        axs[0, 0].set_ylabel('Loss')
-        axs[0, 0].legend()
-        axs[0, 0].grid(True)
-
-        axs[0, 1].clear()
-        axs[0, 1].plot(train_acc_tile_hist, label='Train Acc Tile')
-        axs[0, 1].plot(val_acc_tile_hist, label='Val Acc Tile')
-        axs[0, 1].set_title('Tile Accuracy')
-        axs[0, 1].set_xlabel('Epoch')
-        axs[0, 1].set_ylabel('Accuracy')
-        axs[0, 1].legend()
-        axs[0, 1].grid(True)
-
-        axs[1, 0].clear()
-        axs[1, 0].plot(train_acc_crown_hist, label='Train Acc Crown')
-        axs[1, 0].plot(val_acc_crown_hist, label='Val Acc Crown')
-        axs[1, 0].set_title('Crown Accuracy')
-        axs[1, 0].set_xlabel('Epoch')
-        axs[1, 0].set_ylabel('Accuracy')
-        axs[1, 0].legend()
-        axs[1, 0].grid(True)
-
-        axs[1, 1].axis('off')
-        fig.tight_layout()
-        plt.pause(0.1)
+        plot_training_progress(
+            axs, train_losses, val_losses,
+            train_acc_tile_hist, val_acc_tile_hist,
+            train_acc_crown_hist, val_acc_crown_hist
+        )
 
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
               f"Train Acc Tile: {train_acc_tile:.3f} | Val Acc Tile: {val_acc_tile:.3f} | "
