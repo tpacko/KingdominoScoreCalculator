@@ -135,6 +135,22 @@ def random_perspective(img, kps, max_warp=0.05):
         return img, kps
     return img_warp, kps_warp
 
+def switch_color_channels(img, kps):
+    # 1. Create the permutation indices (0, 1, 2)
+    indices = np.random.permutation(3)
+
+    # 2. Reorder the image array using these indices along the last axis
+    shuffled_img = img[:, :, indices]
+    return shuffled_img, kps
+
+def blur(img, kps, kernel_size = 5):
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0), kps
+
+def random_noise(img, kps, mean=0, std=10):
+    noise = np.random.normal(mean, std, img.shape).astype(np.float32)
+    noisy_img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    return noisy_img, kps
+
 def draw_keypoints(img, kps, color=(0,255,0)):
     img_disp = img.copy()
     for kp in kps:
@@ -159,6 +175,9 @@ def test_augmentation_correctness():
         (random_translate, 'random_translate'),
         (color_jitter, 'color_jitter'),
         (random_perspective, 'random_perspective'),
+        (switch_color_channels, 'switch_color_channels'),
+        (blur, 'blur'),
+        (random_noise, 'random_noise'),
     ]
 
     results = []
@@ -215,6 +234,9 @@ def main():
         (random_translate, 'random_translate'),
         (color_jitter, 'color_jitter'),
         (random_perspective, 'random_perspective'),
+        (switch_color_channels, 'switch_color_channels'),
+        (blur, 'blur'),
+        (random_noise, 'random_noise'),
     ]
 
     print("Testing augmentations on synthetic image and keypoints...")

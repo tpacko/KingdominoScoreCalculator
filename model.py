@@ -126,6 +126,53 @@ class BoardKeypointNet(nn.Module):
         return hm, off, seg
 
 
+# =====================================
+
+class KeypointNet(nn.Module):
+    def __init__(self, base_filters=64):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, base_filters, 5, stride=1, padding=2)
+
+        self.conv2 = nn.Conv2d(base_filters, base_filters * 2, 3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=1, padding=1)
+        self.conv5 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=2, padding=1)
+
+        self.conv6 = nn.Conv2d(base_filters * 2, base_filters * 4, 3, stride=1, padding=1)
+        self.conv7 = nn.Conv2d(base_filters * 4, base_filters * 4, 3, stride=1, padding=1)
+        self.conv8 = nn.Conv2d(base_filters * 4, base_filters * 4, 3, stride=2, padding=1)
+
+        self.conv9 = nn.Conv2d(base_filters * 4, base_filters * 8, 3, stride=1, padding=1)
+        self.conv10 = nn.Conv2d(base_filters * 8, base_filters * 8, 3, stride=1, padding=1)
+        self.conv11 = nn.Conv2d(base_filters * 8, base_filters * 8, 3, stride=1, padding=1)
+
+        self.heatmap = nn.Conv2d(base_filters * 8, 1, 1)
+        self.offsets = nn.Conv2d(base_filters * 8, 2, 1)
+        self.segmentation = nn.Conv2d(base_filters * 8, 1, 1)
+
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = self.relu(self.conv4(x))
+        x = self.relu(self.conv5(x))
+        x = self.relu(self.conv6(x))
+        x = self.relu(self.conv7(x))
+        x = self.relu(self.conv8(x))
+        x = self.relu(self.conv9(x))
+        x = self.relu(self.conv10(x))
+        x = self.relu(self.conv11(x))
+        heatmap = self.sigmoid(self.heatmap(x))
+        offsets = self.tanh(self.offsets(x))
+        segmentation = self.sigmoid(self.segmentation(x))
+        return heatmap, offsets, segmentation
+
+# =====================================
+
 if __name__ == "__main__":
     # Sanity Check
     model = BoardKeypointNet()

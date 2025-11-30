@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
 import keypoint_utils
-from board_keypoint_learn import KeypointNet
+from model import KeypointNet
 from model import BoardKeypointNet
 
 # ==== USER-EDITABLE PARAMETERS (model + folders only!) ====

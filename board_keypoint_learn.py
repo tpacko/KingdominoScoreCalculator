@@ -1,6 +1,7 @@
 import os
 from time import sleep
 from typing import Any
+from xml.dom import VALIDATION_ERR
 
 import torch
 import torch.nn as nn
@@ -16,10 +17,11 @@ import keypoint_utils as kpu
 from keypoint_augmentations import (
     identity, rotate_90, rotate_180, rotate_neg90,
     horizontal_flip, vertical_flip, random_small_rotation,
-    random_scale, random_translate, color_jitter, random_perspective
+    random_scale, random_translate, color_jitter, random_perspective, switch_color_channels, blur, random_noise
 )
 
 from model import BoardKeypointNet
+from losses import mse_loss, bce_loss, dice_loss, offset_loss, seg_loss, focal_loss, focal_mse_loss
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -33,16 +35,17 @@ NUM_CORNERS = kpu.NUM_CORNERS
 
 ANNOTATIONS_PATH = 'annotations.txt'
 IMAGES_PATH = 'files'
-EPOCHS = 250
+EPOCHS = 1000
 BATCH_SIZE = 16
-DETECTIONS = 5
+VALIDATION_PREVIEW_SIZE = 15
 LEARNING_RATE = 1e-5
 
 AUGMENTATIONS = [
     identity,
     color_jitter,
     rotate_90, rotate_180, rotate_neg90, horizontal_flip, vertical_flip,
-    random_small_rotation, random_scale, random_translate, random_perspective
+    random_small_rotation, random_scale, random_translate, random_perspective,
+    switch_color_channels, blur, random_noise
 ]
 
 
@@ -105,124 +108,6 @@ class BoardDataset(Dataset):
             'segmask': seg_tensor
         }
 
-# ============= Model =============
-
-class KeypointNet(nn.Module):
-    def __init__(self, base_filters=64):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, base_filters, 5, stride=1, padding=2)
-
-        self.conv2 = nn.Conv2d(base_filters, base_filters * 2, 3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=1, padding=1)
-        self.conv4 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=1, padding=1)
-        self.conv5 = nn.Conv2d(base_filters * 2, base_filters * 2, 3, stride=2, padding=1)
-
-        self.conv6 = nn.Conv2d(base_filters * 2, base_filters * 4, 3, stride=1, padding=1)
-        self.conv7 = nn.Conv2d(base_filters * 4, base_filters * 4, 3, stride=1, padding=1)
-        self.conv8 = nn.Conv2d(base_filters * 4, base_filters * 4, 3, stride=2, padding=1)
-
-        self.conv9 = nn.Conv2d(base_filters * 4, base_filters * 8, 3, stride=1, padding=1)
-        self.conv10 = nn.Conv2d(base_filters * 8, base_filters * 8, 3, stride=1, padding=1)
-        self.conv11 = nn.Conv2d(base_filters * 8, base_filters * 8, 3, stride=1, padding=1)
-
-        self.heatmap = nn.Conv2d(base_filters * 8, 1, 1)
-        self.offsets = nn.Conv2d(base_filters * 8, 2, 1)
-        self.segmentation = nn.Conv2d(base_filters * 8, 1, 1)
-
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-        self.tanh = nn.Tanh()
-
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.relu(self.conv4(x))
-        x = self.relu(self.conv5(x))
-        x = self.relu(self.conv6(x))
-        x = self.relu(self.conv7(x))
-        x = self.relu(self.conv8(x))
-        x = self.relu(self.conv9(x))
-        x = self.relu(self.conv10(x))
-        x = self.relu(self.conv11(x))
-        heatmap = self.sigmoid(self.heatmap(x))
-        offsets = self.tanh(self.offsets(x))
-        segmentation = self.sigmoid(self.segmentation(x))
-        return heatmap, offsets, segmentation
-
-
-# ============= Losses =============
-
-def mse_loss(y_true, y_pred):
-    return nn.functional.mse_loss(y_pred, y_true)
-
-def bce_loss(y_true, y_pred):
-    return nn.functional.binary_cross_entropy(y_pred, y_true)
-
-
-def dice_loss(y_true, y_pred, smooth=1e-6):
-    y_true_f = y_true.view(-1)
-    y_pred_f = y_pred.view(-1)
-    intersection = torch.sum(y_true_f * y_pred_f)
-    union = torch.sum(y_true_f) + torch.sum(y_pred_f)
-    dice = (2. * intersection + smooth) / (union + smooth)
-    return 1 - dice
-
-
-def offset_loss(y_true, y_pred, mask):
-    diff = (y_true - y_pred) * mask
-    return torch.sum(torch.abs(diff)) / (torch.sum(mask) + 1e-6)
-
-
-def seg_loss(y_true, y_pred, w_bce=1.0, w_dice=1.0):
-    return w_bce * bce_loss(y_true, y_pred) + w_dice * dice_loss(y_true, y_pred)
-
-def focal_loss(pred, gt, alpha=2.0, beta=4.0):
-    # pred should be passed through sigmoid already
-    pos_inds = gt.eq(1).float()
-    neg_inds = gt.lt(1).float()
-
-    neg_weights = torch.pow(1 - gt, beta)
-
-    loss = 0
-    pos_loss = torch.log(pred + 1e-9) * torch.pow(1 - pred, alpha) * pos_inds
-    neg_loss = torch.log(1 - pred + 1e-9) * torch.pow(pred, alpha) * neg_weights * neg_inds
-
-    num_pos = pos_inds.float().sum()
-    pos_loss = pos_loss.sum()
-    neg_loss = neg_loss.sum()
-
-    if num_pos == 0:
-        loss = -neg_loss
-    else:
-        loss = -(pos_loss + neg_loss) / num_pos
-    return loss
-
-
-def focal_mse_loss(pred, gt):
-    pos_inds = gt.eq(1).float()
-    neg_inds = gt.lt(1).float()
-
-    neg_weights = torch.pow(1 - gt, 4)  # Beta=4
-
-    loss = 0
-    pred = torch.clamp(pred, 1e-6, 1 - 1e-6)  # Numerical stability
-
-    # Positive case (center of blob)
-    pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds
-
-    # Negative case (background + surrounding gaussian values)
-    neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds
-
-    num_pos = pos_inds.float().sum()
-    pos_loss = pos_loss.sum()
-    neg_loss = neg_loss.sum()
-
-    if num_pos == 0:
-        loss = -neg_loss
-    else:
-        loss = -(pos_loss + neg_loss) / num_pos
-    return loss
 
 # ============= Training =============
 
@@ -428,6 +313,25 @@ def show_heatmap_comparison(img_path, keypoints, model):
 
 # ============= MAIN =============
 
+def preview_augmentations(dataset):
+    """
+    Preview augmented images from the dataset one by one.
+    Press any key to show the next image, ESC to exit preview.
+    """
+    print("\n--- Augmentation Preview: Press any key for next image, ESC to exit and start training ---")
+    for idx in range(len(dataset)):
+        img_tensor, _ = dataset[idx]
+        # Convert tensor to numpy image (C, H, W) -> (H, W, C), scale to 0-255
+        img = img_tensor.permute(1, 2, 0).cpu().numpy()
+        img = (img * 255).astype(np.uint8)
+        cv2.imshow('Augmented Image Preview', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        key = cv2.waitKey(0)
+        if key == 27:  # ESC key
+            break
+    cv2.destroyAllWindows()
+    print("--- Augmentation preview finished. Starting training... ---\n")
+
+
 def main():
     print("PyTorch version:", torch.__version__)
     print("GPUs:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU detected")
@@ -477,6 +381,9 @@ def main():
     else:
         print("No checkpoint found, training from scratch.")
 
+    # Preview augmentations before training
+    preview_augmentations(train_ds)
+
     # Train
     model = train(model, train_loader, val_loader, epochs=EPOCHS)
 
@@ -495,7 +402,7 @@ def main():
     # show_heatmap_comparison(val_imgs[4], val_kps[4], model)
 
     # Visualize results on validation set
-    max_vis = min(DETECTIONS, len(val_imgs))
+    max_vis = min(VALIDATION_PREVIEW_SIZE, len(val_imgs))
     for i in range(max_vis):
         print(f"Validation sample {i + 1}/{max_vis}: {val_imgs[i]}")
         infer_and_show(model, val_imgs[i], val_kps[i])
