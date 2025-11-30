@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sympy.codegen.cnodes import sizeof
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from PIL import Image
@@ -98,12 +99,48 @@ class TileDataset(Dataset):
         self.augment = augment
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
+
+            # --- geometric transforms ---
             transforms.RandomApply([
-                transforms.RandomRotation(90),
-                transforms.ColorJitter(brightness=0.15, hue=0.05, saturation=0.6),
-            ], p=0.7),
-            transforms.ToTensor()
+                transforms.RandomChoice([
+                    transforms.RandomRotation((0, 0)),
+                    transforms.RandomRotation((90, 90)),
+                    transforms.RandomRotation((180, 180)),
+                    transforms.RandomRotation((270, 270)),
+                ])
+            ], p=0.75),
+
+            transforms.RandomApply([
+                transforms.RandomRotation(10)
+            ], p=0.5),
+
+            # --- color transforms ---
+            transforms.RandomApply([
+                transforms.Grayscale(num_output_channels=3)
+            ], p=0.15),  # 15% grayscale
+
+            transforms.RandomApply([
+                transforms.ColorJitter(
+                    brightness=0.15,
+                    hue=0.05,
+                    saturation=0.6
+                )
+            ], p=0.5),  # 50% jitter
+
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
+            ], p=0.3),  # 30% blur
+
+            transforms.ToTensor(),
+
+            # --- tensor-only ---
+            transforms.RandomErasing(
+                p=0.25,
+                scale=(0.02, 0.1),
+                ratio=(0.3, 3.3)
+            )
         ])
+
     def __len__(self):
         return len(self.images)
     def __getitem__(self, idx):
@@ -121,7 +158,7 @@ class TileDataset(Dataset):
 # -------------------------------
 
 class TileNet(nn.Module):
-    def __init__(self, num_tile_classes, num_crown_classes):
+    def __init__(self, num_tile_classes = len(TILE_CLASSES), num_crown_classes = len(CROWN_CLASSES)):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),

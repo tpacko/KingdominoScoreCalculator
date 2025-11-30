@@ -3,17 +3,23 @@ import torch.nn as nn
 from torch.utils.mobile_optimizer import optimize_for_mobile
 
 from model import BoardKeypointNet
+from tile_learn import TileNet
 
 
 def main():
-    INPUT_MODEL_PATH = "checkpoints/best.pt"
-    OUTPUT_MODEL_NAME = "board_keypoint_detector.ptl"
-    INPUT_IMAGE_SIZE = 512
+    # INPUT_MODEL_PATH = "checkpoints/best.pt"
+    # OUTPUT_MODEL_NAME = "board_keypoint_detector.ptl"
+    # INPUT_IMAGE_SIZE = 512
+    # model = BoardKeypointNet()
+    INPUT_MODEL_PATH = "tile_classifier.pt"
+    OUTPUT_MODEL_NAME = "tile_classifier.ptl"
+    INPUT_IMAGE_SIZE = 128
+    model = TileNet()
 
     print(f"--- Starting Conversion for {INPUT_MODEL_PATH} ---")
 
     # 1. Instantiate the model
-    model = BoardKeypointNet()
+
 
     # 2. Load the trained weights
     try:
