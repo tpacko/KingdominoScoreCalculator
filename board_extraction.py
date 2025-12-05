@@ -9,13 +9,18 @@ Usage:
   python manual_warp.py --image input.jpg --out warped.png
 """
 
-import argparse
 import cv2 as cv
 import numpy as np
 from pathlib import Path
 import os
 
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
 MAX_SIDE = 1000  # Max output side (px)
+INPUT_FILE = 'files/game93.jpg'  # Set your input image path here
+OUT_FOLDER = 'boards'           # Set your output folder here
+
 
 def order_quad(pts):
     pts = np.array(pts, dtype=np.float32)
@@ -27,13 +32,21 @@ def order_quad(pts):
     bl = pts[np.argmax(diff)]
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
-def main():
-    parser = argparse.ArgumentParser(description="Manual quad select and warp (aspect ratio, max 1000 px)")
-    parser.add_argument("--image", required=True, help="Input image")
-    parser.add_argument("--out", required=True, help="Warped output image")
-    args = parser.parse_args()
+def get_next_game_number(out_folder):
+    import re
+    files = os.listdir(out_folder)
+    pattern = re.compile(r'game(\d+)_board\.[^.]+$')
+    max_num = 0
+    for fname in files:
+        match = pattern.match(fname)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+    return max_num + 1
 
-    img_path = Path(args.image)
+def main():
+    img_path = Path(INPUT_FILE)
     if not img_path.exists():
         raise FileNotFoundError(img_path)
     bgr = cv.imread(str(img_path))
@@ -105,11 +118,12 @@ def main():
     cv.waitKey(0)
     cv.destroyAllWindows()
 
-    # Ensure output has valid extension
-    out_path = str(args.out)
-    root, ext = os.path.splitext(out_path)
-    if ext.lower() not in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"]:
-        out_path = root + ".png"
+    # After warping, save to OUT_FOLDER as gameX_board.<ext>
+    ext = img_path.suffix[1:].lower()
+    if ext not in ["png", "jpg", "jpeg", "bmp", "tiff", "tif"]:
+        ext = "png"
+    next_num = get_next_game_number(OUT_FOLDER)
+    out_path = os.path.join(OUT_FOLDER, f"game{next_num}_board.{ext}")
     cv.imwrite(out_path, warped)
     print(f"[✓] Warped image saved to {out_path} – aspect fit, max side legit!")
 

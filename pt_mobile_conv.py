@@ -11,7 +11,7 @@ def main():
     # OUTPUT_MODEL_NAME = "board_keypoint_detector.ptl"
     # INPUT_IMAGE_SIZE = 512
     # model = BoardKeypointNet()
-    INPUT_MODEL_PATH = "tile_classifier.pt"
+    INPUT_MODEL_PATH = "best_tile_classifier.pt"
     OUTPUT_MODEL_NAME = "tile_classifier.ptl"
     INPUT_IMAGE_SIZE = 128
     model = TileNet()

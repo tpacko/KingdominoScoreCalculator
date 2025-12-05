@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-kingdomino_extract_tiles.py – 7×7 grid extractor, equal-size tiles.
+kingdomino_extract_tiles.py – 7×7 or 5x5 grid extractor, equal-size tiles.
 """
 
 import cv2 as cv
 import numpy as np
 import sys
+import random
 from pathlib import Path
+
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
+BOARD_FILES = [
+    'boards/game19_board.jpg',
+    'boards/game20_board.jpg',
+    'boards/game21_board.jpg',
+    'boards/game22_board.jpg',
+]
+GRID_SIZE = 5  # Set your grid size here (e.g., 7 or 5)
 
 def crop_to_grid(img, grid_size=7):
     H, W = img.shape[:2]
@@ -25,40 +37,44 @@ def crop_tiles(board_img, grid_size=7):
     return tiles
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: python kingdomino_extract_tiles.py board.jpg")
-        sys.exit(1)
-    board = cv.imread(sys.argv[1])
-    if board is None:
-        print("cannot read", sys.argv[1])
-        sys.exit(1)
-
-    grid_size = 7
-    board_cropped = crop_to_grid(board, grid_size)
-
-    # Draw division lines for visualization
-    board_lines = board_cropped.copy()
-    H, W = board_cropped.shape[:2]
-    sH, sW = H // grid_size, W // grid_size
-    color = (0, 0, 255)  # Red
-
-    for i in range(1, grid_size):
-        y = i * sH
-        x = i * sW
-        cv.line(board_lines, (0, y), (W, y), color, 2)  # horizontal
-        cv.line(board_lines, (x, 0), (x, H), color, 2)  # vertical
-
-    cv.imshow("Division Lines", board_lines)
-    print("Press any key in the image window to continue...")
-    cv.waitKey(0)
-    cv.destroyAllWindows()
-
     tiles_dir = Path("tiles")
     tiles_dir.mkdir(exist_ok=True)
 
-    tiles = crop_tiles(board_cropped, grid_size)
+    total_tiles = 0
+    for board_path in BOARD_FILES:
+        board = cv.imread(board_path)
+        if board is None:
+            print("cannot read", board_path)
+            continue
 
-    for idx, tile in enumerate(tiles, 1):
-        out_path = tiles_dir / f"{idx}.png"
-        cv.imwrite(str(out_path), tile)
-    print(f"Saved {len(tiles)} tiles to {tiles_dir.resolve()}")
+        board_cropped = crop_to_grid(board, GRID_SIZE)
+
+        # Draw division lines for visualization
+        board_lines = board_cropped.copy()
+        H, W = board_cropped.shape[:2]
+        sH, sW = H // GRID_SIZE, W // GRID_SIZE
+        color = (0, 0, 255)  # Red
+
+        for i in range(1, GRID_SIZE):
+            y = i * sH
+            x = i * sW
+            cv.line(board_lines, (0, y), (W, y), color, 2)  # horizontal
+            cv.line(board_lines, (x, 0), (x, H), color, 2)  # vertical
+
+        cv.imshow(f"Division Lines: {board_path}", board_lines)
+        print(f"Press any key in the image window to continue for {board_path}...")
+        cv.waitKey(0)
+        cv.destroyAllWindows()
+
+        tiles = crop_tiles(board_cropped, GRID_SIZE)
+
+        for tile in tiles:
+            # Generate a unique random number for the filename (no prefix)
+            while True:
+                rand_num = random.randint(100000, 999999)
+                out_path = tiles_dir / f"{rand_num}.png"
+                if not out_path.exists():
+                    break
+            cv.imwrite(str(out_path), tile)
+            total_tiles += 1
+    print(f"Saved {total_tiles} tiles to {tiles_dir.resolve()} (randomized filenames)")
