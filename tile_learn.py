@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 
 from losses import focal_loss
+from model import TileNetWithHeatmap
 
 
 class FocalLoss(nn.Module):
@@ -403,111 +404,6 @@ class TileDatasetWithHeatmap(Dataset):
         tile_label = int(self.tile_labels[idx])
         crown_label = int(self.crown_labels[idx])
         return img, tile_label, crown_label, heatmap
-
-# -------------------------------
-# MAIN FUNCTION
-# -------------------------------
-
-class TileNet(nn.Module):
-    def __init__(self, num_tile_classes = len(TILE_CLASSES), num_crown_classes = len(CROWN_CLASSES)):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 64x64
-
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 32x32
-
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 16x16
-
-            nn.AdaptiveAvgPool2d((4, 4)),  # Flexible pooling
-            nn.Flatten()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.tile_head = nn.Linear(512, num_tile_classes)
-        self.crown_head = nn.Linear(512, num_crown_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.fc(x)
-        tile_logits = self.tile_head(x)
-        crown_logits = self.crown_head(x)
-        return tile_logits, crown_logits
-
-class TileNetWithHeatmap(nn.Module):
-    """TileNet with additional heatmap head for crown localization."""
-    def __init__(self, num_tile_classes = len(TILE_CLASSES), num_crown_classes = len(CROWN_CLASSES)):
-        super().__init__()
-        # Shared feature extraction
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-        )
-        self.pool1 = nn.MaxPool2d(2)  # 64x64
-
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-        )
-        self.pool2 = nn.MaxPool2d(2)  # 32x32
-
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-        )
-        self.pool3 = nn.MaxPool2d(2)  # 16x16
-
-        # Classification heads (pooled features)
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.tile_head = nn.Linear(512, num_tile_classes)
-        self.crown_head = nn.Linear(512, num_crown_classes)
-
-        # Heatmap head (from 32x32 features)
-        # We'll use features from conv2 (which are at 32x32 resolution)
-        self.heatmap_head = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.Conv2d(32, 16, 3, padding=1), nn.BatchNorm2d(16), nn.LeakyReLU(),
-            nn.Conv2d(16, 1, 1),  # 1 channel output
-            nn.Sigmoid()  # Output in [0, 1] range
-        )
-
-    def forward(self, x):
-        # Forward through conv layers
-        x = self.conv1(x)
-        x = self.pool1(x)  # 64x64
-
-        x = self.conv2(x)
-        x = self.pool2(x)  # 32x32
-        feat_32x32 = x  # Save 32x32 features for heatmap
-
-        x = self.conv3(x)
-        x = self.pool3(x)  # 16x16
-
-        # Classification outputs
-        x_cls = self.fc(x)
-        tile_logits = self.tile_head(x_cls)
-        crown_logits = self.crown_head(x_cls)
-
-        # Heatmap output (using 32x32 features after pool2)
-        heatmap = self.heatmap_head(feat_32x32)
-        heatmap = heatmap.squeeze(1)  # Remove channel dimension: (B, 1, 32, 32) -> (B, 32, 32)
-
-        return tile_logits, crown_logits, heatmap
-
 
 # -------------------------------
 # MAIN FUNCTION

@@ -13,6 +13,8 @@ from torchvision import transforms
 import matplotlib.pyplot as plt
 import matplotlib
 
+from model import TileNet
+
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
@@ -179,44 +181,6 @@ class TileDataset(Dataset):
         tile_label = int(self.tile_labels[idx])
         crown_label = int(self.crown_labels[idx])
         return img, tile_label, crown_label
-
-# -------------------------------
-# MODEL DEFINITION
-# -------------------------------
-
-class TileNet(nn.Module):
-    def __init__(self, num_tile_classes = len(TILE_CLASSES), num_crown_classes = len(CROWN_CLASSES)):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 64x64
-
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 32x32
-
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
-            nn.MaxPool2d(2),  # 16x16
-
-            nn.AdaptiveAvgPool2d((4, 4)),  # Flexible pooling
-            nn.Flatten()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.tile_head = nn.Linear(512, num_tile_classes)
-        self.crown_head = nn.Linear(512, num_crown_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.fc(x)
-        tile_logits = self.tile_head(x)
-        crown_logits = self.crown_head(x)
-        return tile_logits, crown_logits
 
 # -------------------------------
 # MAIN FUNCTION

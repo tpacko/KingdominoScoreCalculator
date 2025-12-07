@@ -3,6 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# =====================================
+# BasicBlock: Residual block for deep networks
+# -------------------------------------
+# Purpose: Used in ResNet-style architectures for board/keypoint detection.
+# Input:  image tensor (B, in_planes, H, W)
+# Output: tensor (B, planes, H, W)
+# Use: Internal block for BoardKeypointNet.
 class BasicBlock(nn.Module):
     """
     Standard Residual Block: preserves gradient flow for deep training.
@@ -31,6 +38,16 @@ class BasicBlock(nn.Module):
         return out
 
 
+# =====================================
+# BoardKeypointNet: Board keypoint and segmentation detection
+# ----------------------------------------------------------
+# Purpose: Detects board corners/keypoints, segmentation mask, and offset maps.
+# Input:  image tensor (B, 3, 512, 512)
+# Output: tuple (heatmap, offsets, segmentation)
+#   - heatmap: (B, 1, 64, 64) - probability map for keypoints
+#   - offsets: (B, 2, 64, 64) - x/y offset for keypoints
+#   - segmentation: (B, 1, 64, 64) - board mask
+# Use: Board detection and localization tasks.
 class BoardKeypointNet(nn.Module):
     def __init__(self, num_classes=1):
         super(BoardKeypointNet, self).__init__()
@@ -127,7 +144,15 @@ class BoardKeypointNet(nn.Module):
 
 
 # =====================================
-
+# KeypointNet: General keypoint and segmentation detection
+# -------------------------------------------------------
+# Purpose: Detects keypoints, offsets, and segmentation mask for generic images.
+# Input:  image tensor (B, 3, H, W)
+# Output: tuple (heatmap, offsets, segmentation)
+#   - heatmap: (B, 1, H', W') - probability map for keypoints
+#   - offsets: (B, 2, H', W') - x/y offset for keypoints
+#   - segmentation: (B, 1, H', W') - mask
+# Use: Keypoint detection and segmentation tasks.
 class KeypointNet(nn.Module):
     def __init__(self, base_filters=64):
         super().__init__()
@@ -170,6 +195,113 @@ class KeypointNet(nn.Module):
         offsets = self.tanh(self.offsets(x))
         segmentation = self.sigmoid(self.segmentation(x))
         return heatmap, offsets, segmentation
+
+# =====================================
+# TileNet: Tile and Crown Classification Model
+# -------------------------------------
+# Purpose: Classifies tile type and number of crowns from a tile image.
+# Input:  image tensor of shape (B, 3, 128, 128)
+# Output: tuple (tile_logits, crown_logits)
+#   - tile_logits: (B, num_tile_classes)
+#   - crown_logits: (B, num_crown_classes)
+# Use: For basic tile and crown detection/classification.
+class TileNet(nn.Module):
+    def __init__(self, num_tile_classes, num_crown_classes):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 64x64
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 32x32
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+            nn.MaxPool2d(2),  # 16x16
+            nn.AdaptiveAvgPool2d((4, 4)),  # Flexible pooling
+            nn.Flatten()
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.tile_head = nn.Linear(512, num_tile_classes)
+        self.crown_head = nn.Linear(512, num_crown_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.fc(x)
+        tile_logits = self.tile_head(x)
+        crown_logits = self.crown_head(x)
+        return tile_logits, crown_logits
+
+# =====================================
+# TileNetWithHeatmap: Tile/Crown Classification + Crown Location Heatmap
+# ----------------------------------------------------------------------
+# Purpose: Classifies tile type, number of crowns, and predicts a heatmap
+#          for crown locations (single-channel, 32x32 output).
+# Input:  image tensor of shape (B, 3, 128, 128)
+# Output: tuple (tile_logits, crown_logits, heatmap)
+#   - tile_logits: (B, num_tile_classes)
+#   - crown_logits: (B, num_crown_classes)
+#   - heatmap: (B, 32, 32) (single-channel, Gaussian blobs at crown positions)
+# Use: For tile/crown classification and crown keypoint localization.
+class TileNetWithHeatmap(nn.Module):
+    def __init__(self, num_tile_classes, num_crown_classes):
+        super().__init__()
+        # Shared feature extraction
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 64x64
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.LeakyReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 32x32
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(),
+        )
+        self.pool3 = nn.MaxPool2d(2)  # 16x16
+        # Classification heads (pooled features)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.tile_head = nn.Linear(512, num_tile_classes)
+        self.crown_head = nn.Linear(512, num_crown_classes)
+        # Heatmap head (from 32x32 features)
+        # We'll use features from conv2 (which are at 32x32 resolution)
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.BatchNorm2d(32), nn.LeakyReLU(),
+            nn.Conv2d(32, 16, 3, padding=1), nn.BatchNorm2d(16), nn.LeakyReLU(),
+            nn.Conv2d(16, 1, 1),  # 1 channel output
+            nn.Sigmoid()  # Output in [0, 1] range
+        )
+
+    def forward(self, x):
+        # Forward through conv layers
+        x = self.conv1(x)
+        x = self.pool1(x)  # 64x64
+        x = self.conv2(x)
+        x = self.pool2(x)  # 32x32
+        feat_32x32 = x  # Save 32x32 features for heatmap
+        x = self.conv3(x)
+        x = self.pool3(x)  # 16x16
+        # Classification outputs
+        x_cls = self.fc(x)
+        tile_logits = self.tile_head(x_cls)
+        crown_logits = self.crown_head(x_cls)
+        # Heatmap output (using 32x32 features after pool2)
+        heatmap = self.heatmap_head(feat_32x32)
+        heatmap = heatmap.squeeze(1)  # Remove channel dimension: (B, 1, 32, 32) -> (B, 32, 32)
+        return tile_logits, crown_logits, heatmap
 
 # =====================================
 
