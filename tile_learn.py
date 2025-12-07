@@ -14,46 +14,8 @@ import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import matplotlib
 
-from losses import focal_loss
+from losses import FocalLoss
 from model import TileNetWithHeatmap
-
-
-class FocalLoss(nn.Module):
-    """Focal Loss for heatmap regression to handle class imbalance."""
-    def __init__(self, alpha=2.0, gamma=4.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, pred, target):
-        """
-        Args:
-            pred: predicted heatmap (B, H, W) or (B, 1, H, W)
-            target: target heatmap (B, H, W) or (B, 1, H, W)
-        """
-        # Ensure both pred and target are (B, H, W)
-        if pred.dim() == 4:
-            pred = pred.squeeze(1)
-        if target.dim() == 4:
-            target = target.squeeze(1)
-
-        # Ensure shapes match
-        if pred.shape != target.shape:
-            raise ValueError(f"Shape mismatch: pred {pred.shape} vs target {target.shape}")
-
-        pos_mask = target.eq(1).float()
-        neg_mask = target.lt(1).float()
-
-        pos_loss = torch.log(pred + 1e-12) * torch.pow(1 - pred, self.alpha) * pos_mask
-        neg_loss = torch.log(1 - pred + 1e-12) * torch.pow(pred, self.alpha) * torch.pow(1 - target, self.gamma) * neg_mask
-
-        pos_loss = pos_loss.sum()
-        neg_loss = neg_loss.sum()
-
-        num_pos = pos_mask.sum()
-        if num_pos == 0:
-            return -neg_loss
-        return -(pos_loss + neg_loss) / num_pos
 
 
 # -------------------------------
@@ -71,8 +33,8 @@ EARLY_STOPPING_PATIENCE = 10  # Stop if val loss doesn't improve for this many e
 TILES_FOLDER = 'tiles'  # Path to tiles folder
 
 # Choose heatmap loss function here:
-HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
-# HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
+# HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
+HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
 
 CODE2TERR = {
     "f": "forest",

@@ -75,3 +75,40 @@ def focal_mse_loss(pred, gt):
         loss = -(pos_loss + neg_loss) / num_pos
     return loss
 
+
+class FocalLoss(nn.Module):
+    """Focal Loss for heatmap regression to handle class imbalance."""
+    def __init__(self, alpha=2.0, gamma=4.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: predicted heatmap (B, H, W) or (B, 1, H, W)
+            target: target heatmap (B, H, W) or (B, 1, H, W)
+        """
+        # Ensure both pred and target are (B, H, W)
+        if pred.dim() == 4:
+            pred = pred.squeeze(1)
+        if target.dim() == 4:
+            target = target.squeeze(1)
+
+        # Ensure shapes match
+        if pred.shape != target.shape:
+            raise ValueError(f"Shape mismatch: pred {pred.shape} vs target {target.shape}")
+
+        pos_mask = target.eq(1).float()
+        neg_mask = target.lt(1).float()
+
+        pos_loss = torch.log(pred + 1e-12) * torch.pow(1 - pred, self.alpha) * pos_mask
+        neg_loss = torch.log(1 - pred + 1e-12) * torch.pow(pred, self.alpha) * torch.pow(1 - target, self.gamma) * neg_mask
+
+        pos_loss = pos_loss.sum()
+        neg_loss = neg_loss.sum()
+
+        num_pos = pos_mask.sum()
+        if num_pos == 0:
+            return -neg_loss
+        return -(pos_loss + neg_loss) / num_pos
