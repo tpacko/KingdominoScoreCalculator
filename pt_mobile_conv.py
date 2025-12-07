@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from torch.utils.mobile_optimizer import optimize_for_mobile
 
-from model import BoardKeypointNet
-from tile_learn import TileNet
+from model import TileNet, TileNetWithHeatmap
+from tile_learn import TILE_CLASSES, CROWN_CLASSES
 
 
 def main():
@@ -11,10 +11,16 @@ def main():
     # OUTPUT_MODEL_NAME = "board_keypoint_detector.ptl"
     # INPUT_IMAGE_SIZE = 512
     # model = BoardKeypointNet()
-    INPUT_MODEL_PATH = "best_tile_classifier.pt"
-    OUTPUT_MODEL_NAME = "tile_classifier.ptl"
+
+    # INPUT_MODEL_PATH = "best_tile_classifier.pt"
+    # OUTPUT_MODEL_NAME = "tile_classifier.ptl"
+    # INPUT_IMAGE_SIZE = 128
+    # model = TileNet()
+
+    INPUT_MODEL_PATH = "best_tile_classifier_keypoint.pt"
+    OUTPUT_MODEL_NAME = "tile_classifier_kp.ptl"
     INPUT_IMAGE_SIZE = 128
-    model = TileNet()
+    model = TileNetWithHeatmap(len(TILE_CLASSES), len(CROWN_CLASSES))
 
     print(f"--- Starting Conversion for {INPUT_MODEL_PATH} ---")
 

@@ -29,12 +29,12 @@ EPOCHS = 1000
 LEARNING_RATE = 1e-5  # Learning rate for optimizer
 NETWORK_NAME = 'tile_classifier.pt'  # Model filename (old network)
 NETWORK_NAME_KEYPOINT = 'tile_classifier_keypoint.pt'  # New model with heatmap
-EARLY_STOPPING_PATIENCE = 10  # Stop if val loss doesn't improve for this many epochs
+EARLY_STOPPING_PATIENCE = 20  # Stop if val loss doesn't improve for this many epochs
 TILES_FOLDER = 'tiles'  # Path to tiles folder
 
 # Choose heatmap loss function here:
-# HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
-HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
+HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
+# HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
 
 CODE2TERR = {
     "f": "forest",
@@ -332,7 +332,7 @@ class TileDatasetWithHeatmap(Dataset):
             heatmap = torch.from_numpy(heatmap).float()
 
             # Color transforms (only on image, not heatmap)
-            if random.random() < 0.55:
+            if random.random() < 0.25:
                 img = TF.rgb_to_grayscale(img, num_output_channels=3)
 
             if random.random() < 0.5:
@@ -344,9 +344,24 @@ class TileDatasetWithHeatmap(Dataset):
                 sigma_val = random.uniform(0.1, 0.5)
                 img = TF.gaussian_blur(img, kernel_size=[3, 3], sigma=[sigma_val, sigma_val])
 
+            # Gamma
+            if random.random() < 0.3:
+                gamma = random.uniform(0.9, 1.15)
+                img = torch.clamp(img.pow(gamma), 0.0, 1.0)
+
+            # Sharpness
+            if random.random() < 0.25:
+                img = TF.adjust_sharpness(img, random.uniform(0.9, 1.4))
+
             # Noise (only on image)
             if random.random() < 0.7:
                 img = torch.clamp(img + torch.randn_like(img) * 0.02, 0, 1)
+
+            if random.random() < 0.2:
+                img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
+
+            if random.random() < 0.2:
+                img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
 
             if random.random() < 0.2:
                 img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
@@ -682,6 +697,7 @@ def main():
     print('Training done and model saved!')
 
     print("Manual verification loop starting. Press ENTER to see next image, ESC to quit.")
+    misclassified_count = 0
     for i in range(len(val_ds)):
         img, tile_label, crown_label, heatmap_gt = val_ds[i]
         img_display = (img.permute(1,2,0).numpy() * 255).astype(np.uint8)
@@ -692,12 +708,18 @@ def main():
             tile_idx = tile_logits.argmax(1).item()
             crown_idx = crown_logits.argmax(1).item()
             heatmap_pred_np = heatmap_pred[0].cpu().numpy()
-        tile_name = CODE2TERR[TILE_CLASSES[tile_idx]]
-        crown_val = CROWN_CLASSES[crown_idx]
-        label = f"{tile_name}, {crown_val}c"
-        img_display = draw_label(img_display, label)
 
-        # Show image and heatmap side by side
+        # Skip correctly classified samples (both tile and crown correct)
+        if tile_idx == tile_label and crown_idx == crown_label:
+            continue
+        misclassified_count += 1
+
+        # Predicted label overlay
+        tile_name_pred = CODE2TERR[TILE_CLASSES[tile_idx]]
+        crown_val_pred = CROWN_CLASSES[crown_idx]
+        label_pred = f"{tile_name_pred}, {crown_val_pred}c"
+        img_display = draw_label(img_display, label_pred)
+
         # Resize heatmap to match image size and convert to color
         heatmap_resized = cv2.resize(heatmap_pred_np, (img_display.shape[1], img_display.shape[0]))
         heatmap_colored = cv2.applyColorMap((heatmap_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
@@ -705,12 +727,15 @@ def main():
         # Concatenate horizontally: image | heatmap
         side_by_side = np.concatenate([img_display, heatmap_colored], axis=1)
 
-        cv2.imshow("Validation: Image | Heatmap (ENTER=next, ESC=quit)", side_by_side)
+        cv2.imshow("Validation (misclassified): Image | Heatmap (ENTER=next, ESC=quit)", side_by_side)
         key = cv2.waitKey(0)
         if key == 27:
             print("Exiting manual validation viewer.")
             cv2.destroyAllWindows()
             break
+
+    if misclassified_count == 0:
+        print("No misclassified samples found in validation set.")
 
 if __name__ == "__main__":
     main()

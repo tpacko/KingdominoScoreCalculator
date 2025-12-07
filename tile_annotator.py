@@ -5,7 +5,8 @@ from PIL import Image, ImageTk
 import shutil
 import torch
 from torchvision import transforms
-from tile_learn import TileNet, TILE_CLASSES, CROWN_CLASSES, CODE2TERR, IMG_SIZE
+from tile_learn import TILE_CLASSES, CROWN_CLASSES, CODE2TERR, IMG_SIZE
+from model import TileNet
 
 # Config
 TILES_FOLDER = 'tiles'
