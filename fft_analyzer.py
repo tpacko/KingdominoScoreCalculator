@@ -1,685 +1,604 @@
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
 import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# IMAGE_PATH = 'boards/game1_board.png'
-IMAGE_PATH = 'boards/game10_board.jpg'
-# IMAGE_PATH = 'boards/game14_board.jpg'
+IMAGE_PATH = "boards/game12_board.jpg"
 
-# Preprocessing options (applied in order)
-PREPROCESS_BLUR = False
-BLUR_KERNEL = (15, 15)
-BLUR_SIGMA = 0
+TILES_OPTIONS = (5, 7)
 
-APPLY_CLAHE = True
+# Visualization
+SHOW_CV_STEPS = True
+SHOW_MPL_SUMMARY = True
+CV_WAITKEY_MS = 0  # 0 = waitKey(0)
+DISPLAY_MAX_W = 1200  # 0 = no resizing for display
+DISPLAY_MAX_H = 900   # 0 = no resizing for display
+
+# Save debug images
+DEBUG_DIR = "out_dbg"  # set "" to disable saving debug outputs
+
+# Preprocessing / line evidence extraction
 CLAHE_CLIP = 2.0
-CLAHE_TILE = (8, 8)
+CLAHE_TILE = 8
+GRAD_PERCENTILE = 92.0
 
-# Line filtering (core step for grid detection)
-USE_HOUGH_LINE_FILTER = True  # Detect lines using Canny + HoughLinesP
-USE_MORPHOLOGICAL_FILTER = False  # Morphological opening with h/v kernels
+KLEN_DIV = 18.0
+CLOSE_KSIZE = 3
+OPEN_ITERS = 1
+DILATE_ITERS = 1
 
-# Hough line detection parameters
-CANNY_THRESH1 = 150
-CANNY_THRESH2 = 250
-HOUGH_THRESHOLD = 10
-MIN_LINE_LENGTH = 50
-MAX_LINE_GAP = 30
-ANGLE_TOLERANCE = 10  # degrees from perfect h/v
-LINE_DRAW_THICKNESS = 3
-
-# Morphological filter parameters
-MORPH_KERNEL_SIZE = 15  # kernel length for line extraction
-
-# Optional post-processing (usually not needed after line filtering)
-APPLY_BINARY_THRESH = False
-APPLY_CANNY_FINAL = False
-
-# FFT display options
-LOG_SCALE = True
-SHIFT_ZERO_FREQ = True
-COLORMAP = 'gray'
+# Classifier fusion weights (per axis)
+AXIS_WEIGHTS = {
+    "comb": 0.55,
+    "autocorr": 0.35,
+    "peaks": 0.10,
+}
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# DATA STRUCTURES
 # ============================================================================
-
-def load_image(path):
-    """Load and convert image to grayscale."""
-    img = cv2.imread(path)
-    if img is None:
-        raise FileNotFoundError(f"Could not load image from {path}")
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return gray
-
-
-def apply_blur(img):
-    """Apply Gaussian blur."""
-    if PREPROCESS_BLUR:
-        return cv2.GaussianBlur(img, BLUR_KERNEL, BLUR_SIGMA)
-    return img
-
-
-def apply_clahe(img):
-    """Apply CLAHE contrast enhancement."""
-    if APPLY_CLAHE:
-        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
-        return clahe.apply(img)
-    return img
-
-
-def hough_line_filter(img):
-    """Extract straight horizontal and vertical lines using Canny + HoughLinesP."""
-
-
-    # Adjust min line length based on image size
-    min_len = max(MIN_LINE_LENGTH, min(img.shape) // 20)
-
-    lines = cv2.HoughLinesP(img, 1, np.pi / 180, HOUGH_THRESHOLD,
-                            minLineLength=min_len, maxLineGap=MAX_LINE_GAP)
-
-    h_mask = np.zeros_like(img, dtype=np.uint8)
-    v_mask = np.zeros_like(img, dtype=np.uint8)
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            dx, dy = x2 - x1, y2 - y1
-            if dx == 0 and dy == 0:
-                continue
-
-            angle = abs(math.degrees(math.atan2(dy, dx)))
-
-            # Horizontal: angle ~0 or ~180
-            if angle <= ANGLE_TOLERANCE or abs(angle - 180) <= ANGLE_TOLERANCE:
-                cv2.line(h_mask, (x1, y1), (x2, y2), 255, LINE_DRAW_THICKNESS)
-            # Vertical: angle ~90
-            elif abs(angle - 90) <= ANGLE_TOLERANCE:
-                cv2.line(v_mask, (x1, y1), (x2, y2), 255, LINE_DRAW_THICKNESS)
-
-    # Dilate slightly to connect gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    h_mask = cv2.dilate(h_mask, kernel, iterations=1)
-    v_mask = cv2.dilate(v_mask, kernel, iterations=1)
-
-    # Combine masks
-    combined = cv2.bitwise_or(h_mask, v_mask)
-    return combined, h_mask, v_mask
-
-
-def morphological_line_filter(img):
-    """Extract lines using morphological opening with directional kernels."""
-    # Horizontal kernel
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (MORPH_KERNEL_SIZE, 1))
-    h_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, h_kernel)
-
-    # Vertical kernel
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, MORPH_KERNEL_SIZE))
-    v_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, v_kernel)
-
-    # Combine
-    combined = cv2.bitwise_or(h_lines, v_lines)
-    return combined, h_lines, v_lines
-
-
-
-def filter_directional(img, direction='vertical', thickness=20, threshold=30):
-    """
-    Filter image to keep only vertical or horizontal features using FFT.
-
-    Args:
-        img: Input grayscale image (numpy array)
-        direction: 'vertical' or 'horizontal'
-        thickness: Frequency band thickness (higher = more tolerance)
-        threshold: Binary threshold for output (0-255)
-
-    Returns:
-        Binary image with filtered features
-    """
-    img_float = img.astype(np.float32)
-
-    # FFT
-    f = np.fft.fft2(img_float)
-    fshift = np.fft.fftshift(f)
-
-    # Create directional mask
-    rows, cols = img.shape
-    crow, ccol = rows // 2, cols // 2
-    mask = np.zeros((rows, cols), np.uint8)
-
-    if direction == 'vertical':
-        mask[:, ccol - thickness:ccol + thickness] = 1
-        mask[crow - thickness:crow + thickness, :] = 0
-    elif direction == 'horizontal':
-        mask[crow - thickness:crow + thickness, :] = 1
-        mask[:, ccol - thickness:ccol + thickness] = 0
-
-    # Apply mask and inverse FFT
-    fshift_filtered = fshift * mask
-    f_ishift = np.fft.ifftshift(fshift_filtered)
-    img_back = np.fft.ifft2(f_ishift)
-    img_back = np.abs(img_back)
-
-    # Normalize and threshold
-    img_back = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX)
-    img_back = img_back.astype(np.uint8)
-    _, binary = cv2.threshold(img_back, threshold, 255, cv2.THRESH_BINARY)
-
-    return binary
-
-
-def remove_small_lines(binary_img, min_length=100, min_thickness=30):
-    """
-    Remove short and thin lines from binary image.
-
-    Args:
-        binary_img: Binary image (0/255)
-        min_length: Minimum line length to keep
-        min_thickness: Minimum line thickness to keep
-
-    Returns:
-        Filtered binary image
-    """
-    # Method 1: Morphological operations
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_thickness))
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (min_thickness, 1))
-
-    # Thicken lines slightly
-    dilated = cv2.dilate(binary_img, kernel_v, iterations=1)
-    # Remove noise
-    eroded = cv2.erode(dilated, kernel_v, iterations=1)
-
-    dilated = cv2.dilate(eroded, kernel_h, iterations=1)
-    eroded = cv2.erode(dilated, kernel_h, iterations=1)
-
-    # Method 2: Connected components filtering
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded, connectivity=8)
-
-    result = np.zeros_like(binary_img)
-    for i in range(1, num_labels):  # Skip background (0)
-        x, y, w, h, area = stats[i]
-
-        # Filter by height (for vertical lines)
-        if h >= min_length and w >= min_thickness:
-            result[labels == i] = 255
-
-    return result
-
-def preprocess_image(img):
-    """
-    Main preprocessing pipeline. Returns preprocessed image and debug masks.
-
-    Order: Grayscale → Blur → CLAHE → Line Filtering → Optional Threshold/Canny
-    """
-    window_name = 'Preprocessing Steps'
-
-    # Step 1: Ensure uint8 grayscale
-    processed = img.copy()
-    if processed.dtype != np.uint8:
-        processed = np.clip(processed, 0, 255).astype(np.uint8)
-
-    cv2.imshow(window_name, processed)
-    cv2.setWindowTitle(window_name, 'Step 1: Original Grayscale - Press any key to continue')
-    cv2.waitKey(0)
-
-    # Step 2: Blur (noise reduction)
-    processed = apply_blur(processed)
-    if PREPROCESS_BLUR:
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 2: After Gaussian Blur - Press any key to continue')
-        cv2.waitKey(0)
-
-
-    h = filter_directional(processed, direction='horizontal', thickness=20, threshold=30)
-    v = filter_directional(processed, direction='vertical', thickness=20, threshold=30)
-    processed = cv2.bitwise_or(h, v)
-    cv2.imshow(window_name, processed)
-    cv2.waitKey(0)
-
-    processed = remove_small_lines(processed, min_length=100, min_thickness=1)
-    cv2.imshow(window_name, processed)
-    cv2.waitKey(0)
-
-
-    # Step 3: CLAHE (contrast enhancement)
-    processed = apply_clahe(processed)
-    if APPLY_CLAHE:
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 3: After CLAHE - Press any key to continue')
-        cv2.waitKey(0)
-
-    # Step 4: Line filtering (CORE STEP)
-    h_mask = v_mask = None
-    processed_6 = processed  # Default to original if not using Hough
-    processed_8 = processed
-
-    if USE_HOUGH_LINE_FILTER:
-        processed = cv2.Canny(processed, CANNY_THRESH1, CANNY_THRESH2)
-        cv2.imshow(window_name, processed)
-        cv2.waitKey(0)
-
-        processed, h_mask, v_mask = hough_line_filter(processed)
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 4: Hough Line Filter - Press any key to continue')
-        cv2.waitKey(0)
-
-        # Step 4.5: Create grid masks and filter
-        height, width = processed.shape
-
-        # Create 6-line mask (5x5 grid with borders)
-        mask_6lines = create_grid_mask(height, width, num_lines_h=6, num_lines_v=6, line_thickness=LINE_DRAW_THICKNESS)
-        cv2.imshow(window_name, mask_6lines)
-        cv2.setWindowTitle(window_name, 'Step 4.5a: 6-line Grid Mask (5x5 grid) - Press any key to continue')
-        cv2.waitKey(0)
-
-        # Filter Hough result with 6-line mask
-        filtered_6lines = cv2.bitwise_and(processed, mask_6lines)
-        cv2.imshow(window_name, filtered_6lines)
-        cv2.setWindowTitle(window_name, 'Step 4.5b: Filtered with 6-line Mask - Press any key to continue')
-        cv2.waitKey(0)
-
-        # Create 8-line mask (7x7 grid with borders)
-        mask_8lines = create_grid_mask(height, width, num_lines_h=8, num_lines_v=8, line_thickness=LINE_DRAW_THICKNESS)
-        cv2.imshow(window_name, mask_8lines)
-        cv2.setWindowTitle(window_name, 'Step 4.5c: 8-line Grid Mask (7x7 grid) - Press any key to continue')
-        cv2.waitKey(0)
-
-        # Filter Hough result with 8-line mask
-        filtered_8lines = cv2.bitwise_and(processed, mask_8lines)
-        cv2.imshow(window_name, filtered_8lines)
-        cv2.setWindowTitle(window_name, 'Step 4.5d: Filtered with 8-line Mask - Press any key to continue')
-        cv2.waitKey(0)
-
-        # Store both filtered versions for FFT analysis
-        processed_6 = filtered_6lines
-        processed_8 = filtered_8lines
-
-    elif USE_MORPHOLOGICAL_FILTER:
-        processed, h_mask, v_mask = morphological_line_filter(processed)
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 4: Morphological Filter - Press any key to continue')
-        cv2.waitKey(0)
-        processed_6 = processed
-        processed_8 = processed
-
-    # Step 5: Optional binary threshold
-    if APPLY_BINARY_THRESH:
-        _, processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 5: Binary Threshold - Press any key to continue')
-        cv2.waitKey(0)
-
-    # Step 6: Optional Canny (usually not needed)
-    if APPLY_CANNY_FINAL:
-        processed = cv2.Canny(processed, CANNY_THRESH1, CANNY_THRESH2)
-        cv2.imshow(window_name, processed)
-        cv2.setWindowTitle(window_name, 'Step 6: Canny Edge Detection - Press any key to continue')
-        cv2.waitKey(0)
-
-    # Final result
-    cv2.imshow(window_name, processed)
-    cv2.setWindowTitle(window_name, 'FINAL: Ready for FFT - Press any key to close')
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    return processed, h_mask, v_mask, processed_6, processed_8
-
-
-def compute_fft_2d(image):
-    """Compute 2D FFT."""
-    fft = np.fft.fft2(image)
-    if SHIFT_ZERO_FREQ:
-        fft = np.fft.fftshift(fft)
-    return fft
-
-
-def compute_fft_1d_x(image):
-    """Compute 1D FFT along X axis (averaged over Y)."""
-    signal_x = np.mean(image, axis=0)
-    fft_x = np.fft.fft(signal_x)
-    if SHIFT_ZERO_FREQ:
-        fft_x = np.fft.fftshift(fft_x)
-    return fft_x
-
-
-def compute_fft_1d_y(image):
-    """Compute 1D FFT along Y axis (averaged over X)."""
-    signal_y = np.mean(image, axis=1)
-    fft_y = np.fft.fft(signal_y)
-    if SHIFT_ZERO_FREQ:
-        fft_y = np.fft.fftshift(fft_y)
-    return fft_y
-
-
-def get_magnitude_spectrum(fft_result):
-    """Convert FFT to magnitude spectrum."""
-    magnitude = np.abs(fft_result)
-    if LOG_SCALE:
-        magnitude = np.log(magnitude + 1)
-    return magnitude
-
-
-
-def create_grid_mask(height, width, num_lines_h, num_lines_v, line_thickness=3):
-    """
-    Create a mask with evenly spaced grid lines including borders.
-
-    Args:
-        height: Image height
-        width: Image width
-        num_lines_h: Number of horizontal lines (including top and bottom borders)
-        num_lines_v: Number of vertical lines (including left and right borders)
-        line_thickness: Thickness of the grid lines in pixels
-
-    Returns:
-        Binary mask with grid lines
-    """
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    # Calculate spacing between lines
-    h_spacing = height / (num_lines_h - 1) if num_lines_h > 1 else 0
-    v_spacing = width / (num_lines_v - 1) if num_lines_v > 1 else 0
-
-    # Draw horizontal lines
-    for i in range(num_lines_h):
-        y = int(i * h_spacing)
-        y_start = max(0, y - line_thickness // 2)
-        y_end = min(height, y + line_thickness // 2 + 1)
-        mask[y_start:y_end, :] = 255
-
-    # Draw vertical lines
-    for i in range(num_lines_v):
-        x = int(i * v_spacing)
-        x_start = max(0, x - line_thickness // 2)
-        x_end = min(width, x + line_thickness // 2 + 1)
-        mask[:, x_start:x_end] = 255
-
-    return mask
-
-
-def find_nearest_index(arr, value):
-    """Find index of nearest value in array."""
-    return int(np.argmin(np.abs(arr - value)))
+@dataclass(frozen=True)
+class AxisScores:
+    tiles: int
+    autocorr: float
+    comb: float
+    peaks: float
+    combined_loglik: float
+
+
+@dataclass(frozen=True)
+class AxisResult:
+    axis_name: str
+    n: int
+    profile_raw: np.ndarray
+    profile_hp: np.ndarray
+    scores: List[AxisScores]
+    probs: Dict[int, float]
+    chosen_tiles: int
+
+
+@dataclass(frozen=True)
+class GridResult:
+    tiles: int
+    probs: Dict[int, float]
+    x_axis: AxisResult
+    y_axis: AxisResult
+    debug: Dict[str, float]
 
 
 # ============================================================================
-# MAIN ANALYSIS
+# VIS HELPERS
 # ============================================================================
+def _resize_for_display(img: np.ndarray) -> np.ndarray:
+    if DISPLAY_MAX_W <= 0 and DISPLAY_MAX_H <= 0:
+        return img
+    h, w = img.shape[:2]
+    scale_w = DISPLAY_MAX_W / w if DISPLAY_MAX_W > 0 else 1.0
+    scale_h = DISPLAY_MAX_H / h if DISPLAY_MAX_H > 0 else 1.0
+    s = min(scale_w, scale_h, 1.0)
+    if s >= 1.0:
+        return img
+    nh, nw = int(round(h * s)), int(round(w * s))
+    return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-def main():
-    print(f"Loading image: {IMAGE_PATH}")
-    original = load_image(IMAGE_PATH)
-    height, width = original.shape
-    print(f"Image dimensions: {width}x{height}")
 
-    # Preprocess
-    print("Preprocessing...")
-    preprocessed, h_mask, v_mask, processed_6, processed_8 = preprocess_image(original)
+def _cv_show(title: str, img: np.ndarray) -> None:
+    disp = _resize_for_display(img)
+    cv2.imshow(title, disp)
+    cv2.waitKey(CV_WAITKEY_MS)
 
-    # Compute FFTs for original preprocessed
-    print("Computing FFTs for original preprocessed...")
-    fft_2d = compute_fft_2d(preprocessed)
-    magnitude_2d = get_magnitude_spectrum(fft_2d)
 
-    fft_x = compute_fft_1d_x(preprocessed)
-    fft_y = compute_fft_1d_y(preprocessed)
-    magnitude_x = get_magnitude_spectrum(fft_x)
-    magnitude_y = get_magnitude_spectrum(fft_y)
+def _overlay_masks(bgr: np.ndarray, h_mask: np.ndarray, v_mask: np.ndarray) -> np.ndarray:
+    out = bgr.copy()
+    red = (h_mask > 0)
+    green = (v_mask > 0)
+    out[red] = (0, 0, 255)
+    out[green] = (0, 255, 0)
+    out[red & green] = (0, 255, 255)
+    return out
 
-    # Compute FFTs for 6-line filtered version
-    print("Computing FFTs for 6-line filtered version...")
-    fft_x_6 = compute_fft_1d_x(processed_6)
-    fft_y_6 = compute_fft_1d_y(processed_6)
-    magnitude_x_6 = get_magnitude_spectrum(fft_x_6)
-    magnitude_y_6 = get_magnitude_spectrum(fft_y_6)
 
-    # Compute FFTs for 8-line filtered version
-    print("Computing FFTs for 8-line filtered version...")
-    fft_x_8 = compute_fft_1d_x(processed_8)
-    fft_y_8 = compute_fft_1d_y(processed_8)
-    magnitude_x_8 = get_magnitude_spectrum(fft_x_8)
-    magnitude_y_8 = get_magnitude_spectrum(fft_y_8)
+# ============================================================================
+# UTILITIES
+# ============================================================================
+def _ensure_uint8(gray: np.ndarray) -> np.ndarray:
+    if gray.dtype == np.uint8:
+        return gray
+    gray = np.clip(gray, 0, 255)
+    return gray.astype(np.uint8)
 
-    # Convert to spacing domain
-    freq_x = np.fft.fftfreq(len(magnitude_x))
-    freq_y = np.fft.fftfreq(len(magnitude_y))
-    if SHIFT_ZERO_FREQ:
-        freq_x = np.fft.fftshift(freq_x)
-        freq_y = np.fft.fftshift(freq_y)
 
-    spacing_x = np.zeros_like(freq_x)
-    spacing_y = np.zeros_like(freq_y)
-    mask_x = freq_x != 0
-    mask_y = freq_y != 0
-    spacing_x[mask_x] = 1.0 / np.abs(freq_x[mask_x])
-    spacing_y[mask_y] = 1.0 / np.abs(freq_y[mask_y])
+def _clahe(gray: np.ndarray, clip_limit: float, tile_grid: int) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(tile_grid, tile_grid))
+    return clahe.apply(gray)
 
-    # Focus on valid spacing range (50-500 pixels)
-    valid_x = (spacing_x >= 50) & (spacing_x <= 500)
-    valid_y = (spacing_y >= 50) & (spacing_y <= 500)
 
-    spacing_vals_x = spacing_x[valid_x]
-    spacing_vals_y = spacing_y[valid_y]
-    mags_x = magnitude_x[valid_x]
-    mags_y = magnitude_y[valid_y]
+def _scharr_magnitude(gray: np.ndarray) -> np.ndarray:
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    mag = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+    return mag.astype(np.uint8)
 
-    # Target spacings for 8 lines (7 intervals) vs 6 lines (5 intervals)
-    target_7_x = width / 7.0
-    target_7h_x = width / 14.0  # half-frequency harmonic
-    target_5_x = width / 5.0
-    target_5h_x = width / 10.0
 
-    target_7_y = height / 7.0
-    target_7h_y = height / 14.0
-    target_5_y = height / 5.0
-    target_5h_y = height / 10.0
+def _gaussian_blur_1d(x: np.ndarray, sigma: float) -> np.ndarray:
+    x = x.astype(np.float32)
+    if sigma <= 0:
+        return x
+    k = int(max(3, round(sigma * 6)))
+    if k % 2 == 0:
+        k += 1
+    return cv2.GaussianBlur(x.reshape(1, -1), (k, 1), sigmaX=float(sigma), sigmaY=0).reshape(-1)
 
-    # Analyze X-axis (spatial domain)
-    print("\nAnalyzing X-axis spacing...")
-    results_x = {}
-    if len(spacing_vals_x) > 0:
-        idx_7 = find_nearest_index(spacing_vals_x, target_7_x)
-        idx_7h = find_nearest_index(spacing_vals_x, target_7h_x)
-        idx_5 = find_nearest_index(spacing_vals_x, target_5_x)
-        idx_5h = find_nearest_index(spacing_vals_x, target_5h_x)
 
-        # Get magnitudes directly at target frequencies
-        mag_7 = mags_x[idx_7]
-        mag_7h = mags_x[idx_7h]
-        mag_5 = mags_x[idx_5]
-        mag_5h = mags_x[idx_5h]
+def _highpass_profile(profile: np.ndarray) -> np.ndarray:
+    profile = profile.astype(np.float32)
+    n = len(profile)
+    sigma_small = max(1.5, n / 220.0)
+    sigma_large = max(6.0, n / 30.0)
 
-        # Combine using mean of fundamental + harmonic
-        combined_7 = (mag_7 + mag_7h) / 2.0
-        combined_5 = (mag_5 + mag_5h) / 2.0
+    sm = _gaussian_blur_1d(profile, sigma_small)
+    base = _gaussian_blur_1d(sm, sigma_large)
+    hp = sm - base
+    hp = hp - np.median(hp)
+    return hp.astype(np.float32)
 
-        results_x = {
-            'idx_7': idx_7, 'idx_7h': idx_7h, 'idx_5': idx_5, 'idx_5h': idx_5h,
-            'mag_7': mag_7, 'mag_7h': mag_7h, 'mag_5': mag_5, 'mag_5h': mag_5h,
-            'combined_7': combined_7, 'combined_5': combined_5,
-            'winner': '8 lines (7 intervals)' if combined_7 > combined_5 else '6 lines (5 intervals)',
-            'ratio': max(combined_7, combined_5) / min(combined_7, combined_5) if min(combined_7,
-                                                                                      combined_5) > 0 else float('inf')
-        }
 
-    # Analyze Y-axis (spatial domain)
-    print("Analyzing Y-axis spacing...")
-    results_y = {}
-    if len(spacing_vals_y) > 0:
-        idx_7 = find_nearest_index(spacing_vals_y, target_7_y)
-        idx_7h = find_nearest_index(spacing_vals_y, target_7h_y)
-        idx_5 = find_nearest_index(spacing_vals_y, target_5_y)
-        idx_5h = find_nearest_index(spacing_vals_y, target_5h_y)
+def _percentile_threshold(img_u8: np.ndarray, percentile: float) -> np.ndarray:
+    thr = float(np.percentile(img_u8, percentile))
+    return (img_u8 >= thr).astype(np.uint8) * 255
 
-        # Get magnitudes directly at target frequencies
-        mag_7 = mags_y[idx_7]
-        mag_7h = mags_y[idx_7h]
-        mag_5 = mags_y[idx_5]
-        mag_5h = mags_y[idx_5h]
 
-        # Combine using mean of fundamental + harmonic
-        combined_7 = (mag_7 + mag_7h) / 2.0
-        combined_5 = (mag_5 + mag_5h) / 2.0
+# ============================================================================
+# LINE EVIDENCE EXTRACTION
+# ============================================================================
+def extract_line_masks(
+    gray: np.ndarray,
+    clahe_clip: float,
+    clahe_tile: int,
+    grad_percentile: float,
+    klen_div: float,
+    close_ksize: int,
+    open_iters: int,
+    dilate_iters: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float], Dict[str, np.ndarray]]:
+    gray = _ensure_uint8(gray)
 
-        results_y = {
-            'idx_7': idx_7, 'idx_7h': idx_7h, 'idx_5': idx_5, 'idx_5h': idx_5h,
-            'mag_7': mag_7, 'mag_7h': mag_7h, 'mag_5': mag_5, 'mag_5h': mag_5h,
-            'combined_7': combined_7, 'combined_5': combined_5,
-            'winner': '8 lines (7 intervals)' if combined_7 > combined_5 else '6 lines (5 intervals)',
-            'ratio': max(combined_7, combined_5) / min(combined_7, combined_5) if min(combined_7,
-                                                                                      combined_5) > 0 else float('inf')
-        }
+    clahe_img = _clahe(gray, clahe_clip, clahe_tile)
+    blur_img = cv2.GaussianBlur(clahe_img, (3, 3), 0)
 
-    # Analyze mask filtering results - compare total energy retained
-    print("\nAnalyzing mask filtering results...")
-    energy_6 = np.sum(processed_6 > 0)  # Count non-zero pixels
-    energy_8 = np.sum(processed_8 > 0)
+    mag = _scharr_magnitude(blur_img)
+    bw_thr = _percentile_threshold(mag, grad_percentile)
 
-    results_mask = {
-        'energy_6': energy_6,
-        'energy_8': energy_8,
-        'winner': '6 lines (5x5 grid)' if energy_6 > energy_8 else '8 lines (7x7 grid)',
-        'ratio': max(energy_6, energy_8) / min(energy_6, energy_8) if min(energy_6, energy_8) > 0 else float('inf')
+    close_k = max(3, int(close_ksize))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
+    bw_close = cv2.morphologyEx(bw_thr, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    h, w = gray.shape[:2]
+    klen = int(max(25, round(min(h, w) / float(klen_div))))
+    klen = int(min(klen, min(h, w) - 1 if min(h, w) > 1 else 25))
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, klen))
+
+    h_mask = cv2.morphologyEx(bw_close, cv2.MORPH_OPEN, h_kernel, iterations=int(open_iters))
+    v_mask = cv2.morphologyEx(bw_close, cv2.MORPH_OPEN, v_kernel, iterations=int(open_iters))
+
+    if dilate_iters > 0:
+        d_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        h_mask = cv2.dilate(h_mask, d_kernel, iterations=int(dilate_iters))
+        v_mask = cv2.dilate(v_mask, d_kernel, iterations=int(dilate_iters))
+
+    stats = {
+        "klen": float(klen),
+        "mag_mean": float(np.mean(mag)),
+        "bw_density": float(np.mean(bw_close > 0)),
+        "h_density": float(np.mean(h_mask > 0)),
+        "v_density": float(np.mean(v_mask > 0)),
     }
 
-    # ========================================================================
-    # VISUALIZATION
-    # ========================================================================
+    steps = {
+        "clahe": clahe_img,
+        "blur": blur_img,
+        "mag": mag,
+        "bw_thr": bw_thr,
+        "bw_close": bw_close,
+        "h_mask": h_mask,
+        "v_mask": v_mask,
+    }
+
+    return h_mask, v_mask, stats, steps
+
+
+# ============================================================================
+# PERIODICITY SCORERS (NO FFT)
+# ============================================================================
+def _autocorr_score(sig_hp: np.ndarray, tiles: int) -> float:
+    s = sig_hp.astype(np.float32)
+    s = s - np.mean(s)
+    n = len(s)
+    if n < 8:
+        return 0.0
+
+    F = np.fft.rfft(s)
+    ac = np.fft.irfft(np.abs(F) ** 2, n=n)
+
+    ac0 = float(ac[0]) if float(ac[0]) != 0.0 else 1.0
+    period = float(n) / float(tiles)
+    lo = int(max(1, math.floor(period * 0.85)))
+    hi = int(min(n - 1, math.ceil(period * 1.15)))
+
+    peak = float(np.max(ac[lo:hi + 1]))
+    return float(peak / ac0)
+
+
+def _comb_window_score(sig_hp: np.ndarray, tiles: int) -> float:
+    p = sig_hp.astype(np.float32)
+    p = p - np.mean(p)
+    n = len(p)
+    if n < 8:
+        return 0.0
+
+    period = float(n) / float(tiles)
+    half = int(max(2, round(period * 0.08)))
+
+    c = np.cumsum(np.concatenate([[0.0], p.astype(np.float64)]), dtype=np.float64)
+
+    def win_sum(a: int, b: int) -> float:
+        a = max(0, min(a, n))
+        b = max(0, min(b, n))
+        return float(c[b] - c[a])
+
+    max_off = int(max(1, round(period)))
+    max_off = int(min(max_off, 512))
+
+    best = -1e30
+    for off in range(max_off):
+        s = 0.0
+        for i in range(tiles + 1):
+            x = int(round(off + i * period))
+            s += win_sum(x - half, x + half + 1)
+        if s > best:
+            best = s
+
+    norm = float(np.sum(np.abs(p))) + 1e-6
+    return float(best / norm)
+
+
+def _peak_count_score(sig_hp: np.ndarray, tiles: int) -> Tuple[float, int]:
+    s = sig_hp.astype(np.float32)
+    s = s - np.mean(s)
+    n = len(s)
+    if n < 8:
+        return 0.0, 0
+
+    period = float(n) / float(tiles)
+    sm = _gaussian_blur_1d(s, max(1.0, n / 200.0))
+
+    thr = float(np.percentile(sm, 75))
+    cand = [i for i in range(1, n - 1) if sm[i] > sm[i - 1] and sm[i] > sm[i + 1] and sm[i] > thr]
+    cand.sort(key=lambda i: float(sm[i]), reverse=True)
+
+    min_dist = int(max(1, round(period * 0.50)))
+    sel: List[int] = []
+    for i in cand:
+        if all(abs(i - j) >= min_dist for j in sel):
+            sel.append(i)
+
+    cnt = len(sel)
+    expected = tiles + 1
+    score = math.exp(-abs(cnt - expected))
+    return float(score), cnt
+
+
+def _combine_scores(
+    raw: Dict[int, Dict[str, float]],
+    weights: Dict[str, float],
+) -> Tuple[Dict[int, float], Dict[int, float]]:
+    loglik: Dict[int, float] = {}
+    for t, feats in raw.items():
+        ll = 0.0
+        for k, w in weights.items():
+            v = float(feats.get(k, 0.0))
+            v = max(v, 1e-8)
+            ll += float(w) * math.log(v)
+        loglik[t] = float(ll)
+
+    m = max(loglik.values())
+    ex = {t: math.exp(v - m) for t, v in loglik.items()}
+    z = sum(ex.values())
+    probs = {t: float(ex[t] / z) for t in ex}
+    return loglik, probs
+
+
+def _score_axis_from_mask(
+    mask_u8: np.ndarray,
+    axis_name: str,
+    tiles_options: Tuple[int, int],
+    weights: Dict[str, float],
+) -> AxisResult:
+    if axis_name == "x":
+        profile = np.sum(mask_u8.astype(np.float32), axis=0)
+    elif axis_name == "y":
+        profile = np.sum(mask_u8.astype(np.float32), axis=1)
+    else:
+        raise ValueError("axis_name must be 'x' or 'y'")
+
+    hp = _highpass_profile(profile)
+
+    raw_feats: Dict[int, Dict[str, float]] = {}
+    for t in tiles_options:
+        peaks_score, _ = _peak_count_score(hp, t)
+        raw_feats[t] = {
+            "autocorr": _autocorr_score(hp, t),
+            "comb": _comb_window_score(hp, t),
+            "peaks": peaks_score,
+        }
+
+    loglik, probs = _combine_scores(raw_feats, weights)
+
+    scores_list: List[AxisScores] = []
+    for t in tiles_options:
+        feats = raw_feats[t]
+        scores_list.append(
+            AxisScores(
+                tiles=t,
+                autocorr=float(feats["autocorr"]),
+                comb=float(feats["comb"]),
+                peaks=float(feats["peaks"]),
+                combined_loglik=float(loglik[t]),
+            )
+        )
+
+    chosen = max(probs.items(), key=lambda kv: kv[1])[0]
+    return AxisResult(
+        axis_name=axis_name,
+        n=int(len(profile)),
+        profile_raw=profile.astype(np.float32),
+        profile_hp=hp.astype(np.float32),
+        scores=scores_list,
+        probs=probs,
+        chosen_tiles=int(chosen),
+    )
+
+
+# ============================================================================
+# CLASSIFIER
+# ============================================================================
+def classify_grid(
+    bgr: np.ndarray,
+    tiles_options: Tuple[int, int],
+    clahe_clip: float,
+    clahe_tile: int,
+    grad_percentile: float,
+    klen_div: float,
+    close_ksize: int,
+    open_iters: int,
+    dilate_iters: int,
+    axis_weights: Dict[str, float],
+) -> Tuple[GridResult, Dict[str, np.ndarray]]:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h_mask, v_mask, stats, steps = extract_line_masks(
+        gray=gray,
+        clahe_clip=clahe_clip,
+        clahe_tile=clahe_tile,
+        grad_percentile=grad_percentile,
+        klen_div=klen_div,
+        close_ksize=close_ksize,
+        open_iters=open_iters,
+        dilate_iters=dilate_iters,
+    )
+
+    x_axis = _score_axis_from_mask(v_mask, "x", tiles_options, axis_weights)
+    y_axis = _score_axis_from_mask(h_mask, "y", tiles_options, axis_weights)
+
+    global_loglik: Dict[int, float] = {}
+    for t in tiles_options:
+        ll = 0.0
+        ll += math.log(max(x_axis.probs.get(t, 1e-8), 1e-8))
+        ll += math.log(max(y_axis.probs.get(t, 1e-8), 1e-8))
+        quality = max(0.15, float(stats["h_density"] + stats["v_density"]) / 2.0)
+        ll += math.log(quality)
+        global_loglik[t] = float(ll)
+
+    m = max(global_loglik.values())
+    ex = {t: math.exp(v - m) for t, v in global_loglik.items()}
+    z = sum(ex.values())
+    probs = {t: float(ex[t] / z) for t in ex}
+    chosen = max(probs.items(), key=lambda kv: kv[1])[0]
+
+    debug = dict(stats)
+    debug.update(
+        {
+            "x_p5": float(x_axis.probs.get(5, 0.0)),
+            "x_p7": float(x_axis.probs.get(7, 0.0)),
+            "y_p5": float(y_axis.probs.get(5, 0.0)),
+            "y_p7": float(y_axis.probs.get(7, 0.0)),
+        }
+    )
+
+    steps = dict(steps)
+    steps["gray"] = gray
+    steps["overlay"] = _overlay_masks(bgr, h_mask, v_mask)
+
+    res = GridResult(
+        tiles=int(chosen),
+        probs=probs,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        debug=debug,
+    )
+    return res, steps
+
+
+# ============================================================================
+# DEBUG OUTPUTS
+# ============================================================================
+def save_debug(out_dir: str, bgr: np.ndarray, steps: Dict[str, np.ndarray], res: GridResult) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir, "0_original.png"), bgr)
+    for k in ("gray", "clahe", "blur", "mag", "bw_thr", "bw_close", "h_mask", "v_mask", "overlay"):
+        if k in steps:
+            cv2.imwrite(os.path.join(out_dir, f"{k}.png"), steps[k])
+
+
+def show_all_steps_cv(bgr: np.ndarray, steps: Dict[str, np.ndarray], res: GridResult) -> None:
+    _cv_show("0) Original (BGR)", bgr)
+    _cv_show("1) Grayscale", steps["gray"])
+    _cv_show("2) CLAHE", steps["clahe"])
+    _cv_show("3) Blur", steps["blur"])
+    _cv_show("4) Scharr magnitude", steps["mag"])
+    _cv_show(f"5) Percentile threshold (p={GRAD_PERCENTILE})", steps["bw_thr"])
+    _cv_show("6) After CLOSE", steps["bw_close"])
+    _cv_show("7) Horizontal-line mask (OPEN h-kernel)", steps["h_mask"])
+    _cv_show("8) Vertical-line mask (OPEN v-kernel)", steps["v_mask"])
+    _cv_show("9) Overlay (R=H lines, G=V lines, Y=both)", steps["overlay"])
+
+    banner = np.zeros((200, 800), dtype=np.uint8)
+    msg = f"Decision: {res.tiles}x{res.tiles} | P5={res.probs.get(5,0):.4f} P7={res.probs.get(7,0):.4f}"
+    cv2.putText(banner, msg, (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2, cv2.LINE_AA)
+    _cv_show("10) Result", banner)
+
+
+def show_summary_mpl(bgr: np.ndarray, steps: Dict[str, np.ndarray], res: GridResult) -> None:
     fig = plt.figure(figsize=(18, 12))
 
-    # Plot 1: Original image
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.imshow(original, cmap='gray')
-    ax1.set_title('Original Image')
-    ax1.axis('off')
+    ax = plt.subplot(3, 4, 1)
+    ax.imshow(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    ax.set_title("Original")
+    ax.axis("off")
 
-    # Plot 2: Preprocessed image
-    ax2 = plt.subplot(2, 3, 2)
-    ax2.imshow(preprocessed, cmap='gray')
-    ax2.set_title('Preprocessed (Line Filtered)')
-    ax2.axis('off')
+    ax = plt.subplot(3, 4, 2)
+    ax.imshow(steps["clahe"], cmap="gray")
+    ax.set_title("CLAHE")
+    ax.axis("off")
 
-    # Plot 3: 2D FFT magnitude
-    ax3 = plt.subplot(2, 3, 3)
-    im3 = ax3.imshow(magnitude_2d, cmap=COLORMAP)
-    ax3.set_title('2D FFT Magnitude' + (' (Log)' if LOG_SCALE else ''))
-    plt.colorbar(im3, ax=ax3)
+    ax = plt.subplot(3, 4, 3)
+    ax.imshow(steps["mag"], cmap="gray")
+    ax.set_title("Scharr magnitude")
+    ax.axis("off")
 
-    # Plot 4: Spatial X
-    ax4 = plt.subplot(2, 3, 4)
-    if len(spacing_vals_x) > 0:
-        ax4.plot(spacing_vals_x, mags_x, linewidth=1.5, color='steelblue')
+    ax = plt.subplot(3, 4, 4)
+    ax.imshow(steps["bw_close"], cmap="gray")
+    ax.set_title("Edges (thr+close)")
+    ax.axis("off")
 
-        # Mark target spacings
-        ax4.axvline(target_7_x, color='red', linestyle='--', alpha=0.7, label=f'{target_7_x:.1f}px (7 int)')
-        ax4.axvline(target_7h_x, color='orange', linestyle=':', alpha=0.7, label=f'{target_7h_x:.1f}px (7 harm)')
-        ax4.axvline(target_5_x, color='green', linestyle='--', alpha=0.7, label=f'{target_5_x:.1f}px (5 int)')
-        ax4.axvline(target_5h_x, color='lime', linestyle=':', alpha=0.7, label=f'{target_5h_x:.1f}px (5 harm)')
+    ax = plt.subplot(3, 4, 5)
+    ax.imshow(steps["h_mask"], cmap="gray")
+    ax.set_title("H mask")
+    ax.axis("off")
 
-        # Mark detected peaks
-        ax4.plot(spacing_vals_x[results_x['idx_7']], mags_x[results_x['idx_7']], 'ro', markersize=8)
-        ax4.plot(spacing_vals_x[results_x['idx_7h']], mags_x[results_x['idx_7h']], 'o', color='orangered', markersize=6)
-        ax4.plot(spacing_vals_x[results_x['idx_5']], mags_x[results_x['idx_5']], 'go', markersize=8)
-        ax4.plot(spacing_vals_x[results_x['idx_5h']], mags_x[results_x['idx_5h']], 'o', color='limegreen', markersize=6)
+    ax = plt.subplot(3, 4, 6)
+    ax.imshow(steps["v_mask"], cmap="gray")
+    ax.set_title("V mask")
+    ax.axis("off")
 
-        ax4.text(0.02, 0.98, f"WINNER: {results_x['winner']}\nRatio: {results_x['ratio']:.2f}x",
-                 transform=ax4.transAxes, fontsize=10, va='top',
-                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
-    ax4.set_title('Spatial Domain X (spacing)')
-    ax4.set_xlabel('Spacing (pixels)')
-    ax4.set_ylabel('Magnitude')
-    ax4.set_xlim(50, 500)
-    ax4.grid(True, alpha=0.3)
-    ax4.legend(fontsize=7)
+    ax = plt.subplot(3, 4, 7)
+    ax.imshow(cv2.cvtColor(steps["overlay"], cv2.COLOR_BGR2RGB))
+    ax.set_title("Overlay")
+    ax.axis("off")
 
-    # Plot 5: Spatial Y
-    ax5 = plt.subplot(2, 3, 5)
-    if len(spacing_vals_y) > 0:
-        ax5.plot(spacing_vals_y, mags_y, linewidth=1.5, color='steelblue')
+    ax = plt.subplot(3, 4, 9)
+    ax.plot(res.x_axis.profile_raw, linewidth=1.0, label="raw")
+    ax.plot(res.x_axis.profile_hp, linewidth=1.0, label="highpass")
+    ax.set_title(f"X profile (from V mask)  probs={res.x_axis.probs}")
+    ax.legend()
 
-        ax5.axvline(target_7_y, color='red', linestyle='--', alpha=0.7, label=f'{target_7_y:.1f}px (7 int)')
-        ax5.axvline(target_7h_y, color='orange', linestyle=':', alpha=0.7, label=f'{target_7h_y:.1f}px (7 harm)')
-        ax5.axvline(target_5_y, color='green', linestyle='--', alpha=0.7, label=f'{target_5_y:.1f}px (5 int)')
-        ax5.axvline(target_5h_y, color='lime', linestyle=':', alpha=0.7, label=f'{target_5h_y:.1f}px (5 harm)')
+    ax = plt.subplot(3, 4, 10)
+    ax.plot(res.y_axis.profile_raw, linewidth=1.0, label="raw")
+    ax.plot(res.y_axis.profile_hp, linewidth=1.0, label="highpass")
+    ax.set_title(f"Y profile (from H mask)  probs={res.y_axis.probs}")
+    ax.legend()
 
-        ax5.plot(spacing_vals_y[results_y['idx_7']], mags_y[results_y['idx_7']], 'ro', markersize=8)
-        ax5.plot(spacing_vals_y[results_y['idx_7h']], mags_y[results_y['idx_7h']], 'o', color='orangered', markersize=6)
-        ax5.plot(spacing_vals_y[results_y['idx_5']], mags_y[results_y['idx_5']], 'go', markersize=8)
-        ax5.plot(spacing_vals_y[results_y['idx_5h']], mags_y[results_y['idx_5h']], 'o', color='limegreen', markersize=6)
+    ax = plt.subplot(3, 4, 11)
+    xs = [s.tiles for s in res.x_axis.scores]
+    comb = [s.comb for s in res.x_axis.scores]
+    ac = [s.autocorr for s in res.x_axis.scores]
+    pk = [s.peaks for s in res.x_axis.scores]
+    ax.plot(xs, comb, marker="o", label="comb")
+    ax.plot(xs, ac, marker="o", label="autocorr")
+    ax.plot(xs, pk, marker="o", label="peaks")
+    ax.set_xticks(xs)
+    ax.set_title("X axis feature scores")
+    ax.legend()
 
-        ax5.text(0.02, 0.98, f"WINNER: {results_y['winner']}\nRatio: {results_y['ratio']:.2f}x",
-                 transform=ax5.transAxes, fontsize=10, va='top',
-                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
-    ax5.set_title('Spatial Domain Y (spacing)')
-    ax5.set_xlabel('Spacing (pixels)')
-    ax5.set_ylabel('Magnitude')
-    ax5.set_xlim(50, 500)
-    ax5.grid(True, alpha=0.3)
-    ax5.legend(fontsize=7)
+    ax = plt.subplot(3, 4, 12)
+    ys = [s.tiles for s in res.y_axis.scores]
+    comb = [s.comb for s in res.y_axis.scores]
+    ac = [s.autocorr for s in res.y_axis.scores]
+    pk = [s.peaks for s in res.y_axis.scores]
+    ax.plot(ys, comb, marker="o", label="comb")
+    ax.plot(ys, ac, marker="o", label="autocorr")
+    ax.plot(ys, pk, marker="o", label="peaks")
+    ax.set_xticks(ys)
+    ax.set_title("Y axis feature scores")
+    ax.legend()
 
-    # Plot 6: Line detection masks (bonus)
-    ax6 = plt.subplot(2, 3, 6)
-    if h_mask is not None and v_mask is not None:
-        overlay = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-        overlay[h_mask > 0] = [255, 0, 0]  # Red for horizontal
-        overlay[v_mask > 0] = [0, 255, 0]  # Green for vertical
-        ax6.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        ax6.set_title('Detected Lines (R=horiz, G=vert)')
-    else:
-        ax6.text(0.5, 0.5, 'No line detection used', ha='center', va='center', transform=ax6.transAxes)
-        ax6.set_title('Line Detection Overlay')
-    ax6.axis('off')
-
+    fig.suptitle(
+        f"Decision: {res.tiles}x{res.tiles} | P(5)={res.probs.get(5,0):.4f} P(7)={res.probs.get(7,0):.4f} | "
+        f"klen={res.debug.get('klen',0):.0f} bw={res.debug.get('bw_density',0):.4f} "
+        f"h={res.debug.get('h_density',0):.4f} v={res.debug.get('v_density',0):.4f}"
+    )
     plt.tight_layout()
-    output_file = 'fft_analysis_output.png'
-    plt.savefig(output_file, dpi=150)
-    print(f"\nSaved visualization: {output_file}")
-
-    # Show the plot
     plt.show()
 
-    # ========================================================================
-    # PRINT RESULTS
-    # ========================================================================
-    print("\n" + "=" * 70)
-    print("SPATIAL DOMAIN ANALYSIS RESULTS")
-    print("=" * 70)
 
-    if results_x:
-        print(f"\nX-axis (width={width}):")
-        print(f"  7-interval: spacing={target_7_x:.1f}px, magnitude={results_x['combined_7']:.3f}")
-        print(f"  5-interval: spacing={target_5_x:.1f}px, magnitude={results_x['combined_5']:.3f}")
-        print(f"  → WINNER: {results_x['winner']} (ratio: {results_x['ratio']:.2f}x)")
+# ============================================================================
+# MAIN
+# ============================================================================
+def main() -> None:
+    bgr = cv2.imread(IMAGE_PATH, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Could not read image: {IMAGE_PATH}")
 
-    if results_y:
-        print(f"\nY-axis (height={height}):")
-        print(f"  7-interval: spacing={target_7_y:.1f}px, magnitude={results_y['combined_7']:.3f}")
-        print(f"  5-interval: spacing={target_5_y:.1f}px, magnitude={results_y['combined_5']:.3f}")
-        print(f"  → WINNER: {results_y['winner']} (ratio: {results_y['ratio']:.2f}x)")
+    res, steps = classify_grid(
+        bgr=bgr,
+        tiles_options=TILES_OPTIONS,
+        clahe_clip=CLAHE_CLIP,
+        clahe_tile=CLAHE_TILE,
+        grad_percentile=GRAD_PERCENTILE,
+        klen_div=KLEN_DIV,
+        close_ksize=CLOSE_KSIZE,
+        open_iters=OPEN_ITERS,
+        dilate_iters=DILATE_ITERS,
+        axis_weights=AXIS_WEIGHTS,
+    )
 
-    if results_mask:
-        print(f"\nMask Filtering Results:")
-        print(f"  6-line mask: energy={results_mask['energy_6']} pixels retained")
-        print(f"  8-line mask: energy={results_mask['energy_8']} pixels retained")
-        print(f"  → WINNER: {results_mask['winner']} (ratio: {results_mask['ratio']:.2f}x)")
+    print(f"GRID: {res.tiles}x{res.tiles}")
+    print(f"  P(5x5)={res.probs.get(5,0.0):.6f}  P(7x7)={res.probs.get(7,0.0):.6f}")
+    print(f"  X axis probs: {res.x_axis.probs} chosen={res.x_axis.chosen_tiles}")
+    for s in res.x_axis.scores:
+        print(f"    X tiles={s.tiles}: comb={s.comb:.6f} ac={s.autocorr:.6f} peaks={s.peaks:.6f} ll={s.combined_loglik:.6f}")
+    print(f"  Y axis probs: {res.y_axis.probs} chosen={res.y_axis.chosen_tiles}")
+    for s in res.y_axis.scores:
+        print(f"    Y tiles={s.tiles}: comb={s.comb:.6f} ac={s.autocorr:.6f} peaks={s.peaks:.6f} ll={s.combined_loglik:.6f}")
+    print(
+        "  Diagnostics: "
+        f"klen={res.debug.get('klen'):.0f} "
+        f"bw_density={res.debug.get('bw_density'):.6f} "
+        f"h_density={res.debug.get('h_density'):.6f} "
+        f"v_density={res.debug.get('v_density'):.6f}"
+    )
 
-    print("\n" + "=" * 70)
-    print("FINAL DECISION:")
-    print("=" * 70)
-    if results_x and results_y:
-        if results_x['winner'] == results_y['winner']:
-            print(f"✓ CONSISTENT: Both axes indicate {results_x['winner']}")
-        else:
-            print(f"✗ MIXED: X={results_x['winner']}, Y={results_y['winner']}")
+    if DEBUG_DIR:
+        save_debug(DEBUG_DIR, bgr, steps, res)
+        print(f"Saved debug outputs to: {DEBUG_DIR}")
 
-        if results_mask:
-            print(f"✓ MASK FILTER: {results_mask['winner']}")
-    print("=" * 70)
+    if SHOW_CV_STEPS:
+        show_all_steps_cv(bgr, steps, res)
+        cv2.destroyAllWindows()
+
+    if SHOW_MPL_SUMMARY:
+        show_summary_mpl(bgr, steps, res)
 
 
 if __name__ == "__main__":
