@@ -8,10 +8,11 @@ import math
 # ============================================================================
 # IMAGE_PATH = 'boards/game1_board.png'
 IMAGE_PATH = 'boards/game10_board.jpg'
+# IMAGE_PATH = 'boards/game14_board.jpg'
 
 # Preprocessing options (applied in order)
-PREPROCESS_BLUR = True
-BLUR_KERNEL = (9, 9)
+PREPROCESS_BLUR = False
+BLUR_KERNEL = (15, 15)
 BLUR_SIGMA = 0
 
 APPLY_CLAHE = True
@@ -25,9 +26,9 @@ USE_MORPHOLOGICAL_FILTER = False  # Morphological opening with h/v kernels
 # Hough line detection parameters
 CANNY_THRESH1 = 150
 CANNY_THRESH2 = 250
-HOUGH_THRESHOLD = 80
+HOUGH_THRESHOLD = 10
 MIN_LINE_LENGTH = 50
-MAX_LINE_GAP = 10
+MAX_LINE_GAP = 30
 ANGLE_TOLERANCE = 10  # degrees from perfect h/v
 LINE_DRAW_THICKNESS = 3
 
@@ -74,12 +75,12 @@ def apply_clahe(img):
 
 def hough_line_filter(img):
     """Extract straight horizontal and vertical lines using Canny + HoughLinesP."""
-    edges = cv2.Canny(img, CANNY_THRESH1, CANNY_THRESH2)
+
 
     # Adjust min line length based on image size
     min_len = max(MIN_LINE_LENGTH, min(img.shape) // 20)
 
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, HOUGH_THRESHOLD,
+    lines = cv2.HoughLinesP(img, 1, np.pi / 180, HOUGH_THRESHOLD,
                             minLineLength=min_len, maxLineGap=MAX_LINE_GAP)
 
     h_mask = np.zeros_like(img, dtype=np.uint8)
@@ -126,46 +127,207 @@ def morphological_line_filter(img):
     return combined, h_lines, v_lines
 
 
+
+def filter_directional(img, direction='vertical', thickness=20, threshold=30):
+    """
+    Filter image to keep only vertical or horizontal features using FFT.
+
+    Args:
+        img: Input grayscale image (numpy array)
+        direction: 'vertical' or 'horizontal'
+        thickness: Frequency band thickness (higher = more tolerance)
+        threshold: Binary threshold for output (0-255)
+
+    Returns:
+        Binary image with filtered features
+    """
+    img_float = img.astype(np.float32)
+
+    # FFT
+    f = np.fft.fft2(img_float)
+    fshift = np.fft.fftshift(f)
+
+    # Create directional mask
+    rows, cols = img.shape
+    crow, ccol = rows // 2, cols // 2
+    mask = np.zeros((rows, cols), np.uint8)
+
+    if direction == 'vertical':
+        mask[:, ccol - thickness:ccol + thickness] = 1
+        mask[crow - thickness:crow + thickness, :] = 0
+    elif direction == 'horizontal':
+        mask[crow - thickness:crow + thickness, :] = 1
+        mask[:, ccol - thickness:ccol + thickness] = 0
+
+    # Apply mask and inverse FFT
+    fshift_filtered = fshift * mask
+    f_ishift = np.fft.ifftshift(fshift_filtered)
+    img_back = np.fft.ifft2(f_ishift)
+    img_back = np.abs(img_back)
+
+    # Normalize and threshold
+    img_back = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX)
+    img_back = img_back.astype(np.uint8)
+    _, binary = cv2.threshold(img_back, threshold, 255, cv2.THRESH_BINARY)
+
+    return binary
+
+
+def remove_small_lines(binary_img, min_length=100, min_thickness=30):
+    """
+    Remove short and thin lines from binary image.
+
+    Args:
+        binary_img: Binary image (0/255)
+        min_length: Minimum line length to keep
+        min_thickness: Minimum line thickness to keep
+
+    Returns:
+        Filtered binary image
+    """
+    # Method 1: Morphological operations
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_thickness))
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (min_thickness, 1))
+
+    # Thicken lines slightly
+    dilated = cv2.dilate(binary_img, kernel_v, iterations=1)
+    # Remove noise
+    eroded = cv2.erode(dilated, kernel_v, iterations=1)
+
+    dilated = cv2.dilate(eroded, kernel_h, iterations=1)
+    eroded = cv2.erode(dilated, kernel_h, iterations=1)
+
+    # Method 2: Connected components filtering
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded, connectivity=8)
+
+    result = np.zeros_like(binary_img)
+    for i in range(1, num_labels):  # Skip background (0)
+        x, y, w, h, area = stats[i]
+
+        # Filter by height (for vertical lines)
+        if h >= min_length and w >= min_thickness:
+            result[labels == i] = 255
+
+    return result
+
 def preprocess_image(img):
     """
     Main preprocessing pipeline. Returns preprocessed image and debug masks.
 
     Order: Grayscale → Blur → CLAHE → Line Filtering → Optional Threshold/Canny
     """
+    window_name = 'Preprocessing Steps'
+
     # Step 1: Ensure uint8 grayscale
     processed = img.copy()
     if processed.dtype != np.uint8:
         processed = np.clip(processed, 0, 255).astype(np.uint8)
 
+    cv2.imshow(window_name, processed)
+    cv2.setWindowTitle(window_name, 'Step 1: Original Grayscale - Press any key to continue')
+    cv2.waitKey(0)
+
     # Step 2: Blur (noise reduction)
     processed = apply_blur(processed)
+    if PREPROCESS_BLUR:
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 2: After Gaussian Blur - Press any key to continue')
+        cv2.waitKey(0)
+
+
+    h = filter_directional(processed, direction='horizontal', thickness=20, threshold=30)
+    v = filter_directional(processed, direction='vertical', thickness=20, threshold=30)
+    processed = cv2.bitwise_or(h, v)
+    cv2.imshow(window_name, processed)
+    cv2.waitKey(0)
+
+    processed = remove_small_lines(processed, min_length=100, min_thickness=1)
+    cv2.imshow(window_name, processed)
+    cv2.waitKey(0)
+
 
     # Step 3: CLAHE (contrast enhancement)
     processed = apply_clahe(processed)
+    if APPLY_CLAHE:
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 3: After CLAHE - Press any key to continue')
+        cv2.waitKey(0)
 
     # Step 4: Line filtering (CORE STEP)
     h_mask = v_mask = None
-    if USE_HOUGH_LINE_FILTER and USE_MORPHOLOGICAL_FILTER:
-        # Use both methods - combine results
-        hough_result, h_hough, v_hough = hough_line_filter(processed)
-        morph_result, h_morph, v_morph = morphological_line_filter(processed)
-        processed = cv2.bitwise_or(hough_result, morph_result)
-        h_mask = cv2.bitwise_or(h_hough, h_morph)
-        v_mask = cv2.bitwise_or(v_hough, v_morph)
-    elif USE_HOUGH_LINE_FILTER:
+    processed_6 = processed  # Default to original if not using Hough
+    processed_8 = processed
+
+    if USE_HOUGH_LINE_FILTER:
+        processed = cv2.Canny(processed, CANNY_THRESH1, CANNY_THRESH2)
+        cv2.imshow(window_name, processed)
+        cv2.waitKey(0)
+
         processed, h_mask, v_mask = hough_line_filter(processed)
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 4: Hough Line Filter - Press any key to continue')
+        cv2.waitKey(0)
+
+        # Step 4.5: Create grid masks and filter
+        height, width = processed.shape
+
+        # Create 6-line mask (5x5 grid with borders)
+        mask_6lines = create_grid_mask(height, width, num_lines_h=6, num_lines_v=6, line_thickness=LINE_DRAW_THICKNESS)
+        cv2.imshow(window_name, mask_6lines)
+        cv2.setWindowTitle(window_name, 'Step 4.5a: 6-line Grid Mask (5x5 grid) - Press any key to continue')
+        cv2.waitKey(0)
+
+        # Filter Hough result with 6-line mask
+        filtered_6lines = cv2.bitwise_and(processed, mask_6lines)
+        cv2.imshow(window_name, filtered_6lines)
+        cv2.setWindowTitle(window_name, 'Step 4.5b: Filtered with 6-line Mask - Press any key to continue')
+        cv2.waitKey(0)
+
+        # Create 8-line mask (7x7 grid with borders)
+        mask_8lines = create_grid_mask(height, width, num_lines_h=8, num_lines_v=8, line_thickness=LINE_DRAW_THICKNESS)
+        cv2.imshow(window_name, mask_8lines)
+        cv2.setWindowTitle(window_name, 'Step 4.5c: 8-line Grid Mask (7x7 grid) - Press any key to continue')
+        cv2.waitKey(0)
+
+        # Filter Hough result with 8-line mask
+        filtered_8lines = cv2.bitwise_and(processed, mask_8lines)
+        cv2.imshow(window_name, filtered_8lines)
+        cv2.setWindowTitle(window_name, 'Step 4.5d: Filtered with 8-line Mask - Press any key to continue')
+        cv2.waitKey(0)
+
+        # Store both filtered versions for FFT analysis
+        processed_6 = filtered_6lines
+        processed_8 = filtered_8lines
+
     elif USE_MORPHOLOGICAL_FILTER:
         processed, h_mask, v_mask = morphological_line_filter(processed)
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 4: Morphological Filter - Press any key to continue')
+        cv2.waitKey(0)
+        processed_6 = processed
+        processed_8 = processed
 
     # Step 5: Optional binary threshold
     if APPLY_BINARY_THRESH:
         _, processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 5: Binary Threshold - Press any key to continue')
+        cv2.waitKey(0)
 
     # Step 6: Optional Canny (usually not needed)
     if APPLY_CANNY_FINAL:
         processed = cv2.Canny(processed, CANNY_THRESH1, CANNY_THRESH2)
+        cv2.imshow(window_name, processed)
+        cv2.setWindowTitle(window_name, 'Step 6: Canny Edge Detection - Press any key to continue')
+        cv2.waitKey(0)
 
-    return processed, h_mask, v_mask
+    # Final result
+    cv2.imshow(window_name, processed)
+    cv2.setWindowTitle(window_name, 'FINAL: Ready for FFT - Press any key to close')
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    return processed, h_mask, v_mask, processed_6, processed_8
 
 
 def compute_fft_2d(image):
@@ -203,6 +365,43 @@ def get_magnitude_spectrum(fft_result):
 
 
 
+def create_grid_mask(height, width, num_lines_h, num_lines_v, line_thickness=3):
+    """
+    Create a mask with evenly spaced grid lines including borders.
+
+    Args:
+        height: Image height
+        width: Image width
+        num_lines_h: Number of horizontal lines (including top and bottom borders)
+        num_lines_v: Number of vertical lines (including left and right borders)
+        line_thickness: Thickness of the grid lines in pixels
+
+    Returns:
+        Binary mask with grid lines
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    # Calculate spacing between lines
+    h_spacing = height / (num_lines_h - 1) if num_lines_h > 1 else 0
+    v_spacing = width / (num_lines_v - 1) if num_lines_v > 1 else 0
+
+    # Draw horizontal lines
+    for i in range(num_lines_h):
+        y = int(i * h_spacing)
+        y_start = max(0, y - line_thickness // 2)
+        y_end = min(height, y + line_thickness // 2 + 1)
+        mask[y_start:y_end, :] = 255
+
+    # Draw vertical lines
+    for i in range(num_lines_v):
+        x = int(i * v_spacing)
+        x_start = max(0, x - line_thickness // 2)
+        x_end = min(width, x + line_thickness // 2 + 1)
+        mask[:, x_start:x_end] = 255
+
+    return mask
+
+
 def find_nearest_index(arr, value):
     """Find index of nearest value in array."""
     return int(np.argmin(np.abs(arr - value)))
@@ -220,10 +419,10 @@ def main():
 
     # Preprocess
     print("Preprocessing...")
-    preprocessed, h_mask, v_mask = preprocess_image(original)
+    preprocessed, h_mask, v_mask, processed_6, processed_8 = preprocess_image(original)
 
-    # Compute FFTs
-    print("Computing FFTs...")
+    # Compute FFTs for original preprocessed
+    print("Computing FFTs for original preprocessed...")
     fft_2d = compute_fft_2d(preprocessed)
     magnitude_2d = get_magnitude_spectrum(fft_2d)
 
@@ -231,6 +430,20 @@ def main():
     fft_y = compute_fft_1d_y(preprocessed)
     magnitude_x = get_magnitude_spectrum(fft_x)
     magnitude_y = get_magnitude_spectrum(fft_y)
+
+    # Compute FFTs for 6-line filtered version
+    print("Computing FFTs for 6-line filtered version...")
+    fft_x_6 = compute_fft_1d_x(processed_6)
+    fft_y_6 = compute_fft_1d_y(processed_6)
+    magnitude_x_6 = get_magnitude_spectrum(fft_x_6)
+    magnitude_y_6 = get_magnitude_spectrum(fft_y_6)
+
+    # Compute FFTs for 8-line filtered version
+    print("Computing FFTs for 8-line filtered version...")
+    fft_x_8 = compute_fft_1d_x(processed_8)
+    fft_y_8 = compute_fft_1d_y(processed_8)
+    magnitude_x_8 = get_magnitude_spectrum(fft_x_8)
+    magnitude_y_8 = get_magnitude_spectrum(fft_y_8)
 
     # Convert to spacing domain
     freq_x = np.fft.fftfreq(len(magnitude_x))
@@ -321,6 +534,18 @@ def main():
             'ratio': max(combined_7, combined_5) / min(combined_7, combined_5) if min(combined_7,
                                                                                       combined_5) > 0 else float('inf')
         }
+
+    # Analyze mask filtering results - compare total energy retained
+    print("\nAnalyzing mask filtering results...")
+    energy_6 = np.sum(processed_6 > 0)  # Count non-zero pixels
+    energy_8 = np.sum(processed_8 > 0)
+
+    results_mask = {
+        'energy_6': energy_6,
+        'energy_8': energy_8,
+        'winner': '6 lines (5x5 grid)' if energy_6 > energy_8 else '8 lines (7x7 grid)',
+        'ratio': max(energy_6, energy_8) / min(energy_6, energy_8) if min(energy_6, energy_8) > 0 else float('inf')
+    }
 
     # ========================================================================
     # VISUALIZATION
@@ -437,6 +662,12 @@ def main():
         print(f"  5-interval: spacing={target_5_y:.1f}px, magnitude={results_y['combined_5']:.3f}")
         print(f"  → WINNER: {results_y['winner']} (ratio: {results_y['ratio']:.2f}x)")
 
+    if results_mask:
+        print(f"\nMask Filtering Results:")
+        print(f"  6-line mask: energy={results_mask['energy_6']} pixels retained")
+        print(f"  8-line mask: energy={results_mask['energy_8']} pixels retained")
+        print(f"  → WINNER: {results_mask['winner']} (ratio: {results_mask['ratio']:.2f}x)")
+
     print("\n" + "=" * 70)
     print("FINAL DECISION:")
     print("=" * 70)
@@ -445,6 +676,9 @@ def main():
             print(f"✓ CONSISTENT: Both axes indicate {results_x['winner']}")
         else:
             print(f"✗ MIXED: X={results_x['winner']}, Y={results_y['winner']}")
+
+        if results_mask:
+            print(f"✓ MASK FILTER: {results_mask['winner']}")
     print("=" * 70)
 
 
