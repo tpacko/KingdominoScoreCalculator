@@ -7,7 +7,6 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import random
-from collections import defaultdict
 import cv2
 from torchvision import transforms
 import torchvision.transforms.functional as TF
@@ -25,16 +24,21 @@ IMG_SIZE = 128  # Change if needed
 HEATMAP_SIZE = 32  # Heatmap output size
 GAUSSIAN_SIGMA = 2.0  # Sigma for Gaussian blobs around crown positions
 BATCH_SIZE = 64
-EPOCHS = 1000
-LEARNING_RATE = 1e-5  # Learning rate for optimizer
+EPOCHS = 3500
+LEARNING_RATE = 1e-2  # Learning rate for optimizer
 NETWORK_NAME = 'tile_classifier.pt'  # Model filename (old network)
 NETWORK_NAME_KEYPOINT = 'tile_classifier_keypoint.pt'  # New model with heatmap
-EARLY_STOPPING_PATIENCE = 20  # Stop if val loss doesn't improve for this many epochs
+EARLY_STOPPING_PATIENCE = 200  # Stop if val loss doesn't improve for this many epochs
 TILES_FOLDER = 'tiles'  # Path to tiles folder
 
+# Loss weights (tunable): multiply individual losses by these factors when combining
+LOSS_WEIGHT_TILE = 1.0
+LOSS_WEIGHT_CROWN = 1.0
+LOSS_WEIGHT_HEATMAP = 1.0
+
 # Choose heatmap loss function here:
-HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
-# HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
+# HEATMAP_LOSS = nn.MSELoss()  # Uncomment for MSE loss
+HEATMAP_LOSS = FocalLoss(alpha=2, gamma=4)  # Uncomment for Focal loss
 
 CODE2TERR = {
     "f": "forest",
@@ -141,6 +145,45 @@ def generate_heatmap(crown_positions, original_size, img_size, heatmap_size, sig
     return heatmap
 
 
+def apply_tint_pil(img_pil, strength_range=(0.06, 0.22)):
+    """Apply a random RGB tint to a PIL image and return a PIL image.
+
+    The tint is a solid color blended with the original image using a random strength.
+    Args:
+        img_pil: PIL.Image in RGB mode
+        strength_range: tuple(min, max) blend factor (0..1)
+    Returns:
+        PIL.Image tinted
+    """
+    if not isinstance(img_pil, Image.Image):
+        img_pil = Image.fromarray(img_pil)
+    arr = np.array(img_pil).astype(np.float32) / 255.0
+    # pick a random color (RGB) - prefer somewhat desaturated colors
+    color = np.array([random.uniform(0.0, 1.0) for _ in range(3)], dtype=np.float32)
+    strength = random.uniform(strength_range[0], strength_range[1])
+    arr_tinted = arr * (1.0 - strength) + color.reshape(1, 1, 3) * strength
+    arr_tinted = np.clip(arr_tinted * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr_tinted)
+
+
+def apply_tint_tensor(img_tensor, strength_range=(0.06, 0.22)):
+    """Apply a random RGB tint to a torch tensor image (C,H,W) with values in [0,1].
+
+    Returns a tensor of same shape and dtype on same device.
+    """
+    if not isinstance(img_tensor, torch.Tensor):
+        img_tensor = torch.tensor(img_tensor, dtype=torch.float32)
+    device = img_tensor.device
+    dtype = img_tensor.dtype
+    color = torch.tensor([random.uniform(0.0, 1.0) for _ in range(3)], dtype=dtype, device=device)
+    strength = random.uniform(strength_range[0], strength_range[1])
+    # color to (3,1,1)
+    color = color.view(3, 1, 1)
+    img_tinted = img_tensor * (1.0 - strength) + color * strength
+    return torch.clamp(img_tinted, 0.0, 1.0)
+# --- end new helpers ---
+
+
 def load_tile_images(folder):
     images = []
     tile_labels = []
@@ -243,6 +286,10 @@ class TileDataset(Dataset):
             ], p=0.5),  # 50% jitter
 
             transforms.RandomApply([
+                transforms.Lambda(lambda img: apply_tint_pil(img))
+            ], p=0.35),  # 35% chance to apply a random color tint
+
+            transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
             ], p=0.3),  # 30% blur
 
@@ -334,11 +381,14 @@ class TileDatasetWithHeatmap(Dataset):
             # Color transforms (only on image, not heatmap)
             if random.random() < 0.25:
                 img = TF.rgb_to_grayscale(img, num_output_channels=3)
+            elif random.random() < 0.35:
+                img = apply_tint_tensor(img, strength_range=(0.06, 0.32))
 
             if random.random() < 0.5:
                 img = TF.adjust_brightness(img, random.uniform(0.85, 1.15))
                 img = TF.adjust_saturation(img, random.uniform(0.4, 1.6))
                 img = TF.adjust_hue(img, random.uniform(-0.05, 0.05))
+
 
             if random.random() < 0.3:
                 sigma_val = random.uniform(0.1, 0.5)
@@ -363,8 +413,8 @@ class TileDatasetWithHeatmap(Dataset):
             if random.random() < 0.2:
                 img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
 
-            if random.random() < 0.2:
-                img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
+            # if random.random() < 0.2:
+            #     img = torch.clamp(img + torch.randn_like(img) * 0.1, 0, 1)
 
             # Random erasing (only on image)
             if random.random() < 0.25:
@@ -435,7 +485,8 @@ def run_epoch(model, loader, criterion, optimizer=None, device=None):
         tile_logits, crown_logits = model(imgs)
         loss_tile = criterion(tile_logits, tile_targets)
         loss_crown = criterion(crown_logits, crown_targets)
-        loss = loss_tile + loss_crown
+        # Apply configurable weights to individual losses
+        loss = LOSS_WEIGHT_TILE * loss_tile + LOSS_WEIGHT_CROWN * loss_crown
         if is_train:
             loss.backward()
             optimizer.step()
@@ -476,8 +527,10 @@ def run_epoch_with_heatmap(model, loader, criterion_cls, criterion_heatmap, opti
         loss_crown = criterion_cls(crown_logits, crown_targets)
         loss_heatmap = criterion_heatmap(heatmap_pred, heatmap_targets)
 
-        # Combine losses (weight heatmap loss appropriately)
-        loss = loss_tile + loss_crown + loss_heatmap * 10.0  # Scale heatmap loss
+        # Combine losses using configurable weights
+        loss = (LOSS_WEIGHT_TILE * loss_tile
+                + LOSS_WEIGHT_CROWN * loss_crown
+                + LOSS_WEIGHT_HEATMAP * loss_heatmap)
 
         if is_train:
             loss.backward()
